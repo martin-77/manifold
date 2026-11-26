@@ -641,7 +641,25 @@ fn open_exclusive_part_file(part_path: &Path) -> Result<std::fs::File, String> {
     opts.open(part_path).map_err(|e| e.to_string())
 }
 
+/// Best-effort durability flush of a staged part file before it is renamed
+/// into place (F-34). Directory handles are skipped; the parent directory is
+/// flushed separately via `manifold_vfs::sync_dir` after the rename.
+fn sync_part_file_to_disk(path: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.is_file() {
+        if let Ok(f) = std::fs::File::open(path) {
+            let _ = f.sync_all();
+        }
+    }
+}
+
 pub(super) fn swap_local_staged_into_place(part_path: &Path, dst_path: &str) -> Result<(), String> {
+    // Persist staged contents before the rename so a crash cannot leave a
+    // truncated file at the destination (F-34). This covers paths where the
+    // writer's handle is no longer available (scp/curl downloads).
+    sync_part_file_to_disk(part_path);
     let dst = Path::new(dst_path);
     if dst.is_dir() && !dst.is_symlink() {
         let bak_path = local_part_sibling(dst_path);
@@ -650,15 +668,24 @@ pub(super) fn swap_local_staged_into_place(part_path: &Path, dst_path: &str) -> 
             let _ = std::fs::rename(&bak_path, dst);
             let _ = std::fs::remove_dir_all(part_path);
             let _ = std::fs::remove_file(part_path);
+            if let Some(parent) = dst.parent() {
+                manifold_vfs::sync_dir(parent);
+            }
             return Err(err.to_string());
         }
         let _ = std::fs::remove_dir_all(&bak_path);
+        if let Some(parent) = dst.parent() {
+            manifold_vfs::sync_dir(parent);
+        }
         return Ok(());
     }
     if let Err(err) = std::fs::rename(part_path, dst) {
         let _ = std::fs::remove_file(part_path);
         let _ = std::fs::remove_dir_all(part_path);
         return Err(err.to_string());
+    }
+    if let Some(parent) = dst.parent() {
+        manifold_vfs::sync_dir(parent);
     }
     Ok(())
 }
@@ -710,9 +737,15 @@ fn copy_archive_dir_children(
         local_vfs
             .write_bytes(&part_str, &data)
             .map_err(|e| e.to_string())?;
-        if child.permissions & 0o111 != 0 {
-            let _ = local_vfs.set_permissions(&part_str, child.permissions);
-        }
+        // Apply the recorded entry mode (F-36): previously only executable
+        // bits were transferred, leaving regular entries at the part file's
+        // 0600. Entries without mode information default to 0644.
+        let mode = if child.permissions != 0 {
+            child.permissions
+        } else {
+            0o644
+        };
+        let _ = local_vfs.set_permissions(&part_str, mode);
         swap_local_staged_into_place(&part_dst, &child_dst)?;
         let _ = tx.send(BgWorkerEvent::Progress {
             task_id: task_id.to_string(),
@@ -1071,7 +1104,7 @@ pub(super) fn perform_bg_single_transfer(
             label: label.to_string(),
         });
     }
-    if let Err(err) = writer.flush() {
+    if let Err(err) = writer.flush().and_then(|()| writer.sync_all()) {
         drop(writer);
         let _ = std::fs::remove_file(&part_path);
         return Err(err.to_string());
@@ -1309,4 +1342,77 @@ pub(super) fn sync_terminal_to_window(window: &ManifoldWindow, rt: &mut GuiRunti
         })
         .collect();
     window.set_terminal_lines(ModelRc::new(VecModel::from(slint_lines)));
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+
+    #[test]
+    fn swap_file_replaces_existing_and_leaves_no_part() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("target.bin");
+        std::fs::write(&dst, b"OLD").unwrap();
+        let dst_str = dst.to_string_lossy().to_string();
+
+        let part = local_part_sibling(&dst_str);
+        std::fs::write(&part, b"NEW").unwrap();
+        swap_local_staged_into_place(&part, &dst_str).unwrap();
+
+        assert_eq!(std::fs::read(&dst).unwrap(), b"NEW");
+        assert!(!part.exists(), "part file must be consumed");
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".target"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging leftovers: {leftovers:?}");
+    }
+
+    #[test]
+    fn swap_new_file_without_existing_target_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("fresh.bin");
+        let dst_str = dst.to_string_lossy().to_string();
+        let part = local_part_sibling(&dst_str);
+        std::fs::write(&part, b"DATA").unwrap();
+        swap_local_staged_into_place(&part, &dst_str).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"DATA");
+    }
+
+    #[test]
+    fn swap_directory_replaces_target_dir_and_removes_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("folder");
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(dst.join("old.txt"), b"old").unwrap();
+        let dst_str = dst.to_string_lossy().to_string();
+
+        let part = local_part_sibling(&dst_str);
+        std::fs::create_dir_all(&part).unwrap();
+        std::fs::write(part.join("new.txt"), b"new").unwrap();
+
+        swap_local_staged_into_place(&part, &dst_str).unwrap();
+        assert!(dst.join("new.txt").exists());
+        assert!(!dst.join("old.txt").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".folder"))
+            .collect();
+        assert!(leftovers.is_empty(), "backup leftovers: {leftovers:?}");
+    }
+
+    #[test]
+    fn exclusive_part_file_is_unique_and_not_preexisting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("x.bin");
+        let dst_str = dst.to_string_lossy().to_string();
+        let p1 = local_part_sibling(&dst_str);
+        let p2 = local_part_sibling(&dst_str);
+        assert_ne!(p1, p2, "part suffixes must be unique per call");
+        let f = open_exclusive_part_file(&p1).unwrap();
+        drop(f);
+        assert!(p1.exists());
+    }
 }
