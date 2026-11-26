@@ -33,8 +33,8 @@
 | F-13 | Engine `read_range` chunking O(n²) | static-path | library-only (see F-13b) | fixed | `3864de3` |
 | F-13b | `LocalFsBackend` lacks `read_range` override → inspector loads whole file | static-path | productive (UI inspector) | fixed | `1e71659` |
 | F-14 | Engine ignores pause/cancel handle | static-path | library-only | fixed | `3864de3` |
-| F-15 | Fake remote volume stats (500 GB/470 GB) | static-path | productive | open | — |
-| F-16 | Preview placeholders (1920×1080, 120 s, page 1) | static-path | productive | open | — |
+| F-15 | Fake remote volume stats (500 GB/470 GB) | static-path | productive | fixed | `5767099` |
+| F-16 | Preview placeholders (1920×1080, 120 s, page 1) | static-path | productive | fixed | `5767099` |
 | F-17 | RwLock poisoning panics (no blanket `into_inner` allowed) | static-potential | productive | open | — |
 | F-18 | Sandbox TOCTOU | static-potential | productive | open | — |
 | F-19 | Edit-in-place last-writer-wins | static-path | productive | fixed | `88cd6e6` |
