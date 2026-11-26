@@ -1228,6 +1228,43 @@ impl FileSystemBackend for LocalFsBackend {
         })
     }
 
+    /// Reads at most `length` bytes starting at `offset` using a positional
+    /// seek instead of buffering the whole file (regression F-13b: the trait
+    /// default loaded the complete file for every range request, which made
+    /// the inspector read multi-GB files into RAM on selection).
+    fn read_range(&self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>, VfsError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let resolved = self.resolve_safe_path(path)?;
+        let mut file = fs::File::open(&resolved).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => VfsError::NotFound(path.to_string()),
+            std::io::ErrorKind::PermissionDenied => VfsError::PermissionDenied(path.to_string()),
+            _ => VfsError::IoError(e),
+        })?;
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        // Clamp to EOF first: seeking far past EOF can fail with ESPIPE/
+        // EINVAL on some platforms, and `File::take` with a huge limit would
+        // preallocate the full limit on the chunked-read path. Clamping keeps
+        // memory bounded and yields the same empty result for offsets past
+        // EOF as the trait default.
+        let file_len = file
+            .metadata()
+            .map(|m| m.len())
+            .map_err(VfsError::IoError)?;
+        if offset >= file_len {
+            return Ok(Vec::new());
+        }
+        file.seek(SeekFrom::Start(offset))
+            .map_err(VfsError::IoError)?;
+        let remaining = (file_len - offset).min(length as u64);
+        let mut buf = Vec::with_capacity(remaining as usize);
+        file.take(remaining)
+            .read_to_end(&mut buf)
+            .map_err(VfsError::IoError)?;
+        Ok(buf)
+    }
+
     fn write_bytes(&self, path: &str, data: &[u8]) -> Result<(), VfsError> {
         let resolved = self.resolve_safe_path(path)?;
         if let Some(attrs) = self.get_attrs(&resolved) {
@@ -2015,6 +2052,85 @@ impl FileSystemBackend for ArchiveBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_read_range_matches_full_read_across_offsets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vfs = LocalFsBackend::with_sandbox_root(tmp.path()).unwrap();
+        let payload: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        vfs.write_bytes("range.bin", &payload).unwrap();
+
+        let cases: [(u64, usize); 7] = [
+            (0, 0),
+            (0, 4096),
+            (4095, 1),
+            (4096, 4096),
+            (69_999, 10),
+            (70_000, 10),
+            (1_000_000, 10),
+        ];
+        for (offset, len) in cases {
+            let got = vfs.read_range("range.bin", offset, len).unwrap();
+            let start = (offset as usize).min(payload.len());
+            let end = start.saturating_add(len).min(payload.len());
+            assert_eq!(got, payload[start..end], "offset={offset} len={len}");
+        }
+    }
+
+    #[test]
+    fn test_read_range_beyond_eof_and_overflow_offsets_return_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vfs = LocalFsBackend::with_sandbox_root(tmp.path()).unwrap();
+        vfs.write_bytes("small.bin", b"12345").unwrap();
+
+        assert!(vfs.read_range("small.bin", 5, 4096).unwrap().is_empty());
+        assert!(vfs.read_range("small.bin", 6, 4096).unwrap().is_empty());
+        assert!(vfs
+            .read_range("small.bin", u64::MAX, 4096)
+            .unwrap()
+            .is_empty());
+        assert!(vfs
+            .read_range("small.bin", 1 << 62, 4096)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_read_range_does_not_load_whole_sparse_file() {
+        // Regression guard for F-13b: the previous default implementation
+        // buffered the entire file for a 4 KiB range request. With a 1 TiB
+        // sparse file that allocation fails (or takes minutes) on any
+        // realistic runner; the seek-based implementation must return a
+        // bounded 4 KiB read immediately.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sparse.bin");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(1024 * 1024 * 1024 * 1024).unwrap(); // sparse, no disk use
+        drop(file);
+
+        let vfs = LocalFsBackend::with_sandbox_root(tmp.path()).unwrap();
+        // The sparse file is 1 TiB; a 2 TiB offset must not trigger any
+        // allocation or seek past EOF (regression: File::take with a huge
+        // limit preallocated the full limit).
+        assert!(vfs
+            .read_range("sparse.bin", 2 << 40, 4096)
+            .unwrap()
+            .is_empty());
+        let got = vfs.read_range("sparse.bin", 0, 4096).unwrap();
+        assert_eq!(got.len(), 4096);
+        assert!(got.iter().all(|&b| b == 0));
+
+        let mid = vfs.read_range("sparse.bin", 512 * 1024 * 1024, 16).unwrap();
+        assert_eq!(mid.len(), 16);
+    }
+
+    #[test]
+    fn test_read_range_missing_file_maps_to_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vfs = LocalFsBackend::with_sandbox_root(tmp.path()).unwrap();
+        let err = vfs.read_range("missing.bin", 0, 16).unwrap_err();
+        assert!(matches!(err, VfsError::NotFound(_)), "got {err:?}");
+    }
 
     #[test]
     fn test_permissions_matrix_roundtrip_and_image2_644() {
