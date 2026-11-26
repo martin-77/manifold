@@ -765,7 +765,12 @@ pub fn atomic_write_bytes(path: &Path, data: &[u8]) -> std::io::Result<()> {
     opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        opts.mode(0o600);
+        // The kernel masks this mode with the process umask at open(2)
+        // time, so a brand-new file gets exactly the default
+        // file-creation permissions (R02): a restrictive umask such as
+        // 0077 yields 0600, the common 022 yields 0644. Hard-coding a
+        // mode here would bypass the user's umask.
+        opts.mode(0o666);
     }
     let mut tmp = opts.open(&tmp_path)?;
     if let Err(e) = tmp.write_all(data).and_then(|()| tmp.sync_all()) {
@@ -780,8 +785,12 @@ pub fn atomic_write_bytes(path: &Path, data: &[u8]) -> std::io::Result<()> {
     }
     #[cfg(unix)]
     {
-        let mode = old_meta.map(|m| m.mode() & 0o7777).unwrap_or(0o644);
-        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(mode))?;
+        // Overwriting an existing target preserves that target's mode; a
+        // new file keeps the umask-derived creation mode it already has
+        // (R02), so no explicit permissions are applied in that case.
+        if let Ok(m) = &old_meta {
+            fs::set_permissions(&tmp_path, fs::Permissions::from_mode(m.mode() & 0o7777))?;
+        }
     }
     #[cfg(not(unix))]
     if let Ok(m) = &old_meta {
@@ -2938,5 +2947,82 @@ mod archive_json_tests {
     #[test]
     fn archive_json_listing_still_rejects_zip_slip() {
         assert!(parse_archive_json_listing(r#"[["/../etc/passwd", 1, false]]"#).is_err());
+    }
+
+    // ---- R02: atomic_write_bytes must follow file-creation semantics ----
+
+    /// Runs `atomic_write_bytes` in an isolated child process (umask is
+    /// process-global) and returns the mode of the resulting file. When
+    /// `existing` is `Some`, the target is pre-created with that mode.
+    #[cfg(unix)]
+    fn mode_after_write_under(child_mask: u32, existing: Option<u32>) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("written-by-child.txt");
+        if let Some(mode) = existing {
+            fs::write(&target, b"old").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("archive_json_tests::atomic_write_new_file_respects_umask")
+            .arg("--nocapture")
+            .env("MANIFOLD_UMASK_CHILD_DIR", dir.path())
+            .env("MANIFOLD_UMASK_CHILD_MASK", format!("{child_mask:04o}"))
+            .output()
+            .expect("failed to spawn umask child process");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let reported = stdout
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("MANIFOLD_CHILD_MODE="))
+            .unwrap_or_else(|| {
+                panic!(
+                    "child did not report mode (status {:?}): {stdout}{}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            });
+        u32::from_str_radix(reported, 8).expect("child mode must be octal")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_new_file_respects_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        // Child branch: apply the requested umask, write, report the mode.
+        if let Some(dir) = std::env::var_os("MANIFOLD_UMASK_CHILD_DIR") {
+            let mask = u32::from_str_radix(&std::env::var("MANIFOLD_UMASK_CHILD_MASK").unwrap(), 8)
+                .unwrap();
+            unsafe { libc::umask(mask as libc::mode_t) };
+            let p = Path::new(&dir).join("written-by-child.txt");
+            atomic_write_bytes(&p, b"payload").expect("child atomic_write_bytes failed");
+            let mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+            println!("MANIFOLD_CHILD_MODE={mode:04o}");
+            return;
+        }
+
+        // Parent: restrictive umask must not be bypassed for new files.
+        assert_eq!(
+            mode_after_write_under(0o077, None),
+            0o600,
+            "umask 0077 must yield a 0600 file"
+        );
+        assert_eq!(
+            mode_after_write_under(0o022, None),
+            0o644,
+            "umask 0022 must yield the default 0644 file"
+        );
+        assert_eq!(
+            mode_after_write_under(0o007, None),
+            0o660,
+            "umask 0007 must yield a 0660 file"
+        );
+        // Overwriting an existing target keeps that target's mode even
+        // under a restrictive umask.
+        assert_eq!(
+            mode_after_write_under(0o077, Some(0o640)),
+            0o640,
+            "overwrite must preserve the existing target mode"
+        );
     }
 }
