@@ -932,7 +932,11 @@ impl FileSystemBackend for RemoteVfsBackend {
                     self.run_remote_shell(&format!("rm {flag} -- '{esc}'"))?;
                 }
                 ProtocolType::S3 | ProtocolType::Gcs | ProtocolType::AzureBlob => {
-                    protocols::s3_remove(&self.profile, self.secret.as_deref(), &norm)?;
+                    if recursive {
+                        protocols::s3_remove_tree(&self.profile, self.secret.as_deref(), &norm)?;
+                    } else {
+                        protocols::s3_remove(&self.profile, self.secret.as_deref(), &norm)?;
+                    }
                 }
                 ProtocolType::WebDav | ProtocolType::GoogleDrive => {
                     protocols::webdav_remove(&self.profile, self.secret.as_deref(), &norm)?;
@@ -982,6 +986,7 @@ impl FileSystemBackend for RemoteVfsBackend {
                         &src,
                         &dst,
                         true,
+                        false,
                     )?;
                 }
                 ProtocolType::Ftp | ProtocolType::Ftps => {
@@ -1026,6 +1031,7 @@ impl FileSystemBackend for RemoteVfsBackend {
                         self.secret.as_deref(),
                         &src,
                         &dst,
+                        false,
                         false,
                     );
                 }

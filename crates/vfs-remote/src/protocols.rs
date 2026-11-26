@@ -19,30 +19,18 @@ use sha2::{Digest, Sha256};
 
 use crate::parse_ls_aln_output;
 
-/// Computes `HMAC-SHA256(key, message)` in pure Rust using `sha2::Sha256`.
+/// Computes `HMAC-SHA256(key, message)` with the audited RustCrypto `hmac`
+/// crate (F-20; replaces the previous hand-rolled construction).
 pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    let mut k_block = [0u8; 64];
-    if key.len() > 64 {
-        let hashed = Sha256::digest(key);
-        k_block[..32].copy_from_slice(&hashed);
-    } else {
-        k_block[..key.len()].copy_from_slice(key);
-    }
-    let mut ipad = [0x36u8; 64];
-    let mut opad = [0x5cu8; 64];
-    for i in 0..64 {
-        ipad[i] ^= k_block[i];
-        opad[i] ^= k_block[i];
-    }
-    let mut inner = Sha256::new();
-    inner.update(ipad);
-    inner.update(message);
-    let inner_hash = inner.finalize();
-
-    let mut outer = Sha256::new();
-    outer.update(opad);
-    outer.update(inner_hash);
-    outer.finalize().into()
+    use hmac::{Hmac, Mac};
+    type HmacSha256 = Hmac<Sha256>;
+    // `new_from_slice` only errors on impossible key lengths for HMAC.
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(message);
+    let result = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
 }
 
 pub fn hex_encode(bytes: &[u8]) -> String {
@@ -301,13 +289,56 @@ pub fn s3_list_directory(
     } else {
         format!("{prefix_rel}/")
     };
+    let access_key_owned = access_key.to_string();
+    let secret_key_owned = secret.unwrap_or("").trim().to_string();
+    let mut entries = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        // F-5: ListObjectsV2 returns at most 1000 keys per page; keep
+        // fetching with the continuation token until not truncated.
+        let xml = s3_list_page(
+            &ep,
+            &access_key_owned,
+            &secret_key_owned,
+            &s3_prefix,
+            true,
+            token.as_deref(),
+        )?;
+        entries.extend(parse_s3_list_xml(&xml, norm_path, &s3_prefix, access_key));
+        token = s3_next_token(&xml);
+        if token.is_none() {
+            break;
+        }
+    }
+    Ok(entries)
+}
+
+/// Fetches one `ListObjectsV2` page. Query parameters are assembled in the
+/// lexicographic order AWS SigV4 requires; `delimiter` selects one-level
+/// listings and `token` continues a truncated listing (F-5).
+fn s3_list_page(
+    ep: &S3EndpointSpec,
+    access_key: &str,
+    secret_key: &str,
+    s3_prefix: &str,
+    delimiter: bool,
+    token: Option<&str>,
+) -> Result<String, VfsError> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(t) = token {
+        parts.push(format!("continuation-token={}", uri_encode_s3(t, true)));
+    }
+    if delimiter {
+        parts.push("delimiter=%2F".to_string());
+    }
+    parts.push("list-type=2".to_string());
+    parts.push(format!("prefix={}", uri_encode_s3(s3_prefix, true)));
+    let canonical_query = parts.join("&");
     let canonical_uri = if ep.bucket_prefix.is_empty() {
         "/".to_string()
     } else {
         format!("{}/", ep.bucket_prefix)
     };
-    let encoded_prefix = uri_encode_s3(&s3_prefix, true);
-    let canonical_query = format!("delimiter=%2F&list-type=2&prefix={encoded_prefix}");
     let url = format!("{}{canonical_uri}?{canonical_query}", ep.base_url);
     let empty_sha = sha256_hex(b"");
     let amz_date = current_amz_date();
@@ -325,10 +356,17 @@ pub fn s3_list_directory(
     });
     cfg.push(format!("url = {}", escape_curl_config_val(&url)));
     let xml_bytes = run_curl_with_stdin_config(&cfg, &[])?;
-    let xml_str = String::from_utf8_lossy(&xml_bytes);
-    Ok(parse_s3_list_xml(
-        &xml_str, norm_path, &s3_prefix, access_key,
-    ))
+    Ok(String::from_utf8_lossy(&xml_bytes).into_owned())
+}
+
+/// Returns the continuation token when a `ListObjectsV2` page was
+/// truncated, `None` otherwise (F-5).
+fn s3_next_token(xml: &str) -> Option<String> {
+    if xml.contains("<IsTruncated>true</IsTruncated>") {
+        extract_xml_tag_text(xml, "NextContinuationToken")
+    } else {
+        None
+    }
 }
 
 /// Parses an AWS S3 `ListObjectsV2` XML response into [`FileMetadata`] entries.
@@ -497,6 +535,45 @@ pub fn s3_upload_file(
     Ok(())
 }
 
+/// Runs a curl download to `local_path` atomically (F-3): the transfer is
+/// written to a unique temp file in the destination directory and only
+/// renamed into place after curl reported success, so a failed or
+/// interrupted transfer never truncates an existing file. The temp file is
+/// removed when the transfer fails.
+fn curl_download_atomically(
+    cfg: &mut Vec<String>,
+    local_path: &Path,
+    extra_args: &[&str],
+) -> Result<(), VfsError> {
+    static DL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = DL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = local_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    let tmp = dir.join(format!(".manifold-dl-{}-{}.part", std::process::id(), seq));
+    cfg.push(format!(
+        "output = {}",
+        escape_curl_config_val(&tmp.to_string_lossy())
+    ));
+    if let Err(e) = run_curl_with_stdin_config(cfg, extra_args) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Ok(f) = fs::File::open(&tmp) {
+        let _ = f.sync_all();
+    }
+    if let Err(e) = fs::rename(&tmp, local_path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(VfsError::IoError(e));
+    }
+    if let Some(parent) = local_path.parent() {
+        manifold_vfs::sync_dir(parent);
+    }
+    Ok(())
+}
+
 pub fn s3_download_file(
     profile: &ConnectionProfile,
     secret: Option<&str>,
@@ -522,12 +599,7 @@ pub fn s3_download_file(
         amz_date: &amz_date,
     });
     cfg.push(format!("url = {}", escape_curl_config_val(&url)));
-    cfg.push(format!(
-        "output = {}",
-        escape_curl_config_val(&local_path.to_string_lossy())
-    ));
-    let _ = run_curl_with_stdin_config(&cfg, &[])?;
-    Ok(())
+    curl_download_atomically(&mut cfg, local_path, &[])
 }
 
 pub fn s3_create_dir(
@@ -546,6 +618,75 @@ pub fn s3_remove(
 ) -> Result<(), VfsError> {
     let ep = resolve_s3_endpoint(profile)?;
     let key = norm_path.trim_start_matches('/');
+    s3_delete_key(profile, secret, &ep, key)
+}
+
+/// Recursively deletes every object under `norm_path/` plus the directory
+/// marker itself (F-4). Previously only the addressed key was deleted, so
+/// child objects survived and the "directory" reappeared on the next
+/// listing. Per-object failures are collected and reported; the operation
+/// continues with the remaining keys.
+pub fn s3_remove_tree(
+    profile: &ConnectionProfile,
+    secret: Option<&str>,
+    norm_path: &str,
+) -> Result<(), VfsError> {
+    let ep = resolve_s3_endpoint(profile)?;
+    let access_key = profile.username.trim();
+    let secret_key = secret.unwrap_or("").trim();
+    let dir_prefix = format!("{}/", norm_path.trim_matches('/'));
+    let mut token: Option<String> = None;
+    let mut failures: Vec<String> = Vec::new();
+    loop {
+        let xml = s3_list_page(
+            &ep,
+            access_key,
+            secret_key,
+            &dir_prefix,
+            false,
+            token.as_deref(),
+        )?;
+        let mut rem = xml.as_str();
+        while let Some(start) = rem.find("<Contents>") {
+            let after = &rem[start + 10..];
+            let Some(end) = after.find("</Contents>") else {
+                break;
+            };
+            let block = &after[..end];
+            if let Some(key) = extract_xml_tag_text(block, "Key") {
+                if let Err(e) = s3_delete_key(profile, secret, &ep, &key) {
+                    failures.push(format!("{key}: {e}"));
+                }
+            }
+            rem = &after[end + 11..];
+        }
+        token = s3_next_token(&xml);
+        if token.is_none() {
+            break;
+        }
+    }
+    // The marker key may not exist (some tools omit it); S3 DELETE is
+    // idempotent, so a failure here is not fatal when children were deleted.
+    let marker_res = s3_delete_key(profile, secret, &ep, &dir_prefix);
+    if !failures.is_empty() {
+        return Err(VfsError::OperationFailed(
+            norm_path.to_string(),
+            format!(
+                "failed to delete {} object(s): {}",
+                failures.len(),
+                failures.join("; ")
+            ),
+        ));
+    }
+    marker_res
+}
+
+fn s3_delete_key(
+    profile: &ConnectionProfile,
+    secret: Option<&str>,
+    ep: &S3EndpointSpec,
+    key: &str,
+) -> Result<(), VfsError> {
     let encoded_key = uri_encode_s3(key, false);
     let canonical_uri = format!("{}/{encoded_key}", ep.bucket_prefix);
     let url = format!("{}{canonical_uri}", ep.base_url);
@@ -738,12 +879,7 @@ pub fn webdav_download_file(
 ) -> Result<(), VfsError> {
     let url = resolve_webdav_url(profile, norm_path)?;
     let mut cfg = webdav_auth_config(profile, secret, &url);
-    cfg.push(format!(
-        "output = {}",
-        escape_curl_config_val(&local_path.to_string_lossy())
-    ));
-    let _ = run_curl_with_stdin_config(&cfg, &[])?;
-    Ok(())
+    curl_download_atomically(&mut cfg, local_path, &[])
 }
 
 pub fn webdav_write_bytes(
@@ -789,6 +925,7 @@ pub fn webdav_move_or_copy(
     from_norm: &str,
     to_norm: &str,
     is_move: bool,
+    overwrite: bool,
 ) -> Result<(), VfsError> {
     let src_url = resolve_webdav_url(profile, from_norm)?;
     let dst_url = resolve_webdav_url(profile, to_norm)?;
@@ -797,7 +934,14 @@ pub fn webdav_move_or_copy(
         "header = {}",
         escape_curl_config_val(&format!("Destination: {dst_url}"))
     ));
-    cfg.push("header = \"Overwrite: T\"".to_string());
+    // F-6: `Overwrite: T` silently destroyed an existing destination.
+    // The default is now `F`; the server rejects with 412 Precondition
+    // Failed and the error propagates. Callers that have already resolved
+    // a conflict (e.g. deleted the target) may pass `overwrite: true`.
+    cfg.push(format!(
+        "header = {}",
+        escape_curl_config_val(&format!("Overwrite: {}", if overwrite { "T" } else { "F" }))
+    ));
     let method = if is_move { "MOVE" } else { "COPY" };
     let _ = run_curl_with_stdin_config(&cfg, &["-X", method])?;
     Ok(())
@@ -912,13 +1056,8 @@ pub fn ftp_download_file(
 ) -> Result<(), VfsError> {
     let url = resolve_ftp_url(profile, norm_path, false)?;
     let mut cfg = ftp_auth_config(profile, secret, &url);
-    cfg.push(format!(
-        "output = {}",
-        escape_curl_config_val(&local_path.to_string_lossy())
-    ));
     let extra = ftp_extra_args(profile, false);
-    let _ = run_curl_with_stdin_config(&cfg, &extra)?;
-    Ok(())
+    curl_download_atomically(&mut cfg, local_path, &extra)
 }
 
 pub fn ftp_write_bytes(
@@ -1473,12 +1612,64 @@ fn extract_xml_tag_text_ns(xml: &str, local_tag: &str) -> Option<String> {
     None
 }
 
+/// Decodes XML entities in a single left-to-right pass (F-20): the previous
+/// chained `String::replace` calls double-decoded, so `&amp;lt;` wrongly
+/// became `<` instead of the literal `&lt;`. Also accepts numeric character
+/// references (`&#39;`, `&#x27;`).
 fn xml_unescape(raw: &str) -> String {
-    raw.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(idx) = rest.find('&') {
+        out.push_str(&rest[..idx]);
+        let tail = &rest[idx + 1..];
+        if let Some(code) = tail.strip_prefix('#') {
+            let (digits, radix) = if let Some(hex) = code.strip_prefix('x') {
+                (hex, 16u32)
+            } else {
+                (code, 10u32)
+            };
+            let semi = digits.find(';').unwrap_or(digits.len());
+            let terminated = digits.as_bytes().get(semi) == Some(&b';');
+            let num = u32::from_str_radix(&digits[..semi], radix)
+                .ok()
+                .filter(|_| !digits[..semi].is_empty());
+            match (terminated, num.and_then(char::from_u32)) {
+                (true, Some(c)) => {
+                    out.push(c);
+                    // consumed = '#' [+ 'x'] + digits + ';'
+                    let consumed = tail.len() - digits[semi..].len();
+                    rest = &tail[consumed + 1..];
+                    continue;
+                }
+                _ => {
+                    out.push('&');
+                    rest = tail;
+                    continue;
+                }
+            }
+        }
+        let entity = [
+            ("amp", '&'),
+            ("lt", '<'),
+            ("gt", '>'),
+            ("quot", '"'),
+            ("apos", '\''),
+        ]
+        .into_iter()
+        .find(|(name, _)| tail.starts_with(*name) && tail[name.len()..].starts_with(';'));
+        match entity {
+            Some((name, c)) => {
+                out.push(c);
+                rest = &tail[name.len() + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn percent_decode_str(input: &str) -> String {
@@ -1499,4 +1690,162 @@ fn percent_decode_str(input: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    #[test]
+    fn hmac_sha256_matches_known_answer() {
+        // openssl dgst -sha256 -hmac key
+        let mac = hmac_sha256(b"key", b"The quick brown fox jumps over the lazy dog");
+        assert_eq!(
+            hex_encode(&mac),
+            "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+    }
+
+    #[test]
+    fn xml_unescape_never_double_decodes() {
+        assert_eq!(xml_unescape("&amp;lt;"), "&lt;");
+        assert_eq!(xml_unescape("&amp;amp;"), "&amp;");
+        assert_eq!(xml_unescape("&lt;script&gt;"), "<script>");
+        assert_eq!(xml_unescape("a &amp; b &amp; c"), "a & b & c");
+        assert_eq!(xml_unescape("Tom&apos;s &quot;x&quot;"), "Tom's \"x\"");
+        assert_eq!(xml_unescape("plain text"), "plain text");
+        assert_eq!(xml_unescape("100% & not-an-entity"), "100% & not-an-entity");
+    }
+
+    #[test]
+    fn xml_unescape_numeric_references() {
+        assert_eq!(xml_unescape("&#39;quoted&#39;"), "'quoted'");
+        assert_eq!(xml_unescape("&#x41;&#66;"), "AB");
+        assert_eq!(xml_unescape("&#38;lt;"), "&lt;");
+        assert_eq!(xml_unescape("&#;broken"), "&#;broken");
+        assert_eq!(xml_unescape("&#xZZ;"), "&#xZZ;");
+    }
+
+    /// Serializes tests that shadow the real `curl` via `PATH`.
+    fn curl_path_lock() -> std::sync::MutexGuard<'static, ()> {
+        static PATH_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        PATH_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Installs a fake `curl` binary whose behavior is defined by `body`
+    /// (a POSIX snippet receiving the curl config on stdin).
+    fn install_fake_curl(body: &str) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("curl");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut combined = std::ffi::OsString::from(dir.path());
+        if let Some(old) = std::env::var_os("PATH") {
+            combined.push(":");
+            combined.push(&old);
+        }
+        std::env::set_var("PATH", combined);
+        dir
+    }
+
+    fn s3_profile() -> ConnectionProfile {
+        let mut profile = ConnectionProfile::new_sftp_default("s3-1", "Test Bucket");
+        profile.protocol = ProtocolType::S3;
+        profile.endpoint = Some("s3.example.com".to_string());
+        profile.bucket = Some("mybucket".to_string());
+        profile.username = "AKIAEXAMPLE".to_string();
+        profile
+    }
+
+    #[test]
+    fn s3_list_directory_follows_continuation_tokens() {
+        let _guard = curl_path_lock();
+        let dir = install_fake_curl(
+            r#"cfg=$(cat)
+case "$cfg" in
+  *continuation-token=*)
+    printf '<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>docs/b.txt</Key><Size>2</Size></Contents></ListBucketResult>'
+    ;;
+  *)
+    printf '<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>t/1+2=</NextContinuationToken><Contents><Key>docs/a.txt</Key><Size>1</Size></Contents></ListBucketResult>'
+    ;;
+esac"#,
+        );
+        let entries = s3_list_directory(&s3_profile(), Some("secret"), "/docs").unwrap();
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a.txt", "b.txt"], "both pages must be listed");
+        drop(dir);
+    }
+
+    #[test]
+    fn s3_remove_tree_deletes_every_child_key_and_marker() {
+        let _guard = curl_path_lock();
+        let log_dir = tempfile::tempdir().unwrap();
+        let log = log_dir.path().join("deleted.log");
+        std::env::set_var("MANIFOLD_DELETE_LOG", &log);
+        let dir = install_fake_curl(
+            r#"cfg=$(cat)
+case "$cfg" in
+  *"list-type=2"*)
+    printf '<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>docs/a.txt</Key></Contents><Contents><Key>docs/sub/c.txt</Key></Contents></ListBucketResult>'
+    ;;
+  *)
+    printf '%s\n' "$cfg" | grep '^url = ' >> "$MANIFOLD_DELETE_LOG"
+    ;;
+esac"#,
+        );
+        s3_remove_tree(&s3_profile(), Some("secret"), "/docs").unwrap();
+        let deleted = std::fs::read_to_string(&log).unwrap();
+        assert!(deleted.contains("docs/a.txt"), "child a missing: {deleted}");
+        assert!(
+            deleted.contains("docs/sub/c.txt"),
+            "grandchild missing: {deleted}"
+        );
+        assert!(deleted.contains("docs/"), "marker missing: {deleted}");
+        std::env::remove_var("MANIFOLD_DELETE_LOG");
+        drop(dir);
+    }
+
+    #[test]
+    fn webdav_download_replaces_target_only_on_success() {
+        let _guard = curl_path_lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("out.bin");
+        std::fs::write(&target, b"ORIGINAL").unwrap();
+
+        // Failing transfer (HTTP 4xx with --fail-with-body): the existing
+        // file must survive untouched (F-3).
+        let dir = install_fake_curl(
+            r#"cfg=$(cat)
+out=$(printf '%s\n' "$cfg" | sed -n 's/^output = //p' | tr -d '"')
+printf 'PARTIAL' > "$out"
+exit 22"#,
+        );
+        let err = webdav_download_file(&s3_profile(), Some("s"), "/remote.bin", &target)
+            .expect_err("failed transfer must error");
+        let _ = err;
+        assert_eq!(std::fs::read(&target).unwrap(), b"ORIGINAL");
+        drop(dir);
+
+        // Successful transfer: content replaced atomically, no leftovers.
+        let dir = install_fake_curl(
+            r#"cfg=$(cat)
+out=$(printf '%s\n' "$cfg" | sed -n 's/^output = //p' | tr -d '"')
+printf 'NEW-CONTENT' > "$out"
+exit 0"#,
+        );
+        webdav_download_file(&s3_profile(), Some("s"), "/remote.bin", &target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"NEW-CONTENT");
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".manifold-dl"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp download leftovers: {leftovers:?}"
+        );
+        drop(dir);
+    }
 }
