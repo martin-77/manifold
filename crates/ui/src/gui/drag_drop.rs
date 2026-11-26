@@ -1,5 +1,43 @@
 use super::*;
 
+/// F-23: returns the staged local paths when `cache` was produced for
+/// exactly `key` (same drag items) and every file still exists on disk.
+fn drag_stage_cache_hit(
+    cache: &Option<(Vec<String>, Vec<String>)>,
+    key: &[String],
+) -> Option<Vec<String>> {
+    let (cached_key, paths) = cache.as_ref()?;
+    (cached_key == key && paths.iter().all(|p| Path::new(p).exists())).then(|| paths.clone())
+}
+
+#[cfg(test)]
+mod drag_stage_cache_tests {
+    use super::*;
+
+    #[test]
+    fn cache_hits_same_key_and_misses_changed_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let paths = vec![
+            a.to_string_lossy().to_string(),
+            b.to_string_lossy().to_string(),
+        ];
+        let key = vec!["sftp://h/a.txt".to_string(), "sftp://h/b.txt".to_string()];
+        let cache = Some((key.clone(), paths.clone()));
+
+        assert_eq!(drag_stage_cache_hit(&cache, &key), Some(paths.clone()));
+        // Different items must re-stage (no stale remote copies).
+        assert_eq!(drag_stage_cache_hit(&cache, &["other".to_string()]), None);
+        // A deleted staged file must re-stage, not hand the OS a dangling URL.
+        std::fs::remove_file(&b).unwrap();
+        assert_eq!(drag_stage_cache_hit(&cache, &key), None);
+        assert_eq!(drag_stage_cache_hit(&None, &key), None);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(super) enum DragModifierMode {
     #[default]
@@ -604,6 +642,24 @@ impl GuiRuntime {
         &mut self,
         items: &[FileMetadata],
     ) -> Vec<String> {
+        // F-23: this runs from the mouse-move handler while hovering an
+        // external drop target. Without the per-session cache every event
+        // re-downloaded all remote files synchronously on the UI thread.
+        let key: Vec<String> = items.iter().map(|m| m.path.clone()).collect();
+        if let Some(hit) = drag_stage_cache_hit(&self.drag_out_stage_cache, &key) {
+            return hit;
+        }
+        let mut out = self.stage_paths_for_external_drag(items);
+        // Only directories that were skipped (never draggable) or staging
+        // failures should not be handed to the OS drag session.
+        out.retain(|p| Path::new(p).exists());
+        if !out.is_empty() {
+            self.drag_out_stage_cache = Some((key, out.clone()));
+        }
+        out
+    }
+
+    fn stage_paths_for_external_drag(&mut self, items: &[FileMetadata]) -> Vec<String> {
         let mut out = Vec::with_capacity(items.len());
         let stage_dir = manifold_vfs::secure_runtime_subdir("drag-out")
             .unwrap_or_else(|_| std::env::temp_dir().join("manifold-drag-out"));

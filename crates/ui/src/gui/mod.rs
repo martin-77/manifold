@@ -429,6 +429,10 @@ struct GuiRuntime {
     session_save_tick: u32,
     session_dirty: bool,
     native_os_drag_handed_off: bool,
+    /// F-23: `(item keys, staged local paths)` for the current drag-out
+    /// session; prevents re-downloading remote files on every mouse-move
+    /// event and is cleared when the drag ends.
+    drag_out_stage_cache: Option<(Vec<String>, Vec<String>)>,
     update_tx: mpsc::Sender<UpdateCheckEvent>,
     update_rx: mpsc::Receiver<UpdateCheckEvent>,
     latest_update: Option<ReleaseUpdateInfo>,
@@ -720,6 +724,7 @@ impl GuiRuntime {
             session_save_tick: 0,
             session_dirty: false,
             native_os_drag_handed_off: false,
+            drag_out_stage_cache: None,
             update_tx,
             update_rx,
             latest_update: None,
@@ -6692,6 +6697,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
         window.on_select_file_row(move |is_right, row_idx| {
             let mut guard = rt.borrow_mut();
             guard.native_os_drag_handed_off = false;
+            guard.drag_out_stage_cache = None; // F-23: new interaction
             guard.pending_rename_click = None;
             guard.hover_candidate = None;
             guard.last_hovered_cell = None;
@@ -6719,6 +6725,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             };
             let mut guard = rt.borrow_mut();
             guard.native_os_drag_handed_off = false;
+            guard.drag_out_stage_cache = None; // F-23: new interaction
             guard.hover_candidate = None;
             guard.last_hovered_cell = None;
             let idx = row_idx as usize;
@@ -7994,6 +8001,9 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
 
             let (os_move, os_copy) = query_os_drag_modifiers(fm, fc);
             let mut guard = rt.borrow_mut();
+            // F-23: the drag session is over; drop the staging cache so the
+            // next drag re-downloads fresh remote content.
+            guard.drag_out_stage_cache = None;
             if guard.native_os_drag_handed_off {
                 guard.native_os_drag_handed_off = false;
                 return;
@@ -9519,10 +9529,19 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
     }
 
     // 45ms UI Feedback Timer: drives the Tasks spinner, progress bar, async sync/thumbs, & status
+    // (F-22: only runs at full cadence while something animates or polls;
+    // idle periods drop to 250ms to cut wakeups and energy use.)
     let anim_timer = Timer::default();
     {
         let rt = Rc::clone(&rt);
         let win_weak = window.as_weak();
+        // F-22: the closure needs to re-arm `anim_timer` from inside its
+        // own callback. `Timer` is neither `Clone` nor `'static`-capturable
+        // by reference, so a raw handle is used. It is sound for the whole
+        // event loop: `anim_timer` is owned by this function and only drops
+        // after `window.run()` returns, which stops the timer.
+        let timer_ptr: *const Timer = &anim_timer;
+        let is_fast = Rc::new(std::cell::Cell::new(true));
         anim_timer.start(TimerMode::Repeated, Duration::from_millis(45), move || {
             let Some(w) = win_weak.upgrade() else {
                 return;
@@ -9775,6 +9794,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                 && !is_primary_mouse_button_pressed()
             {
                 guard.native_os_drag_handed_off = false;
+                guard.drag_out_stage_cache = None; // F-23
                 let x = w.get_drag_ghost_x();
                 let y = w.get_drag_ghost_y();
                 clear_window_drag_overlay(&w);
@@ -9864,7 +9884,38 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                     .collect();
                 w.set_transfer_rows(ModelRc::new(VecModel::from(tr_rows)));
             }
+
+            // F-22: keep the 45 ms cadence only while something animates,
+            // polls or waits for user gestures; when fully idle, wake just
+            // 4× a second to cut event-loop churn and energy use.
+            let active = guard.bg_tasks_in_flight > 0
+                || guard.active_task_ticks > 0
+                || guard.sync_running
+                || guard.status_banner_ticks > 0
+                || guard.pending_rename_click.is_some()
+                || !guard.thumb_queue.borrow().is_empty()
+                || w.get_show_terminal_drawer()
+                || w.get_is_dragging_row()
+                || guard.native_os_drag_handed_off;
+            if active != is_fast.get() {
+                is_fast.set(active);
+                // SAFETY: see `timer_ptr` declaration — valid for the
+                // entire event loop this callback runs in.
+                unsafe {
+                    (*timer_ptr).set_interval(Duration::from_millis(if active { 45 } else { 250 }))
+                };
+            }
         });
+    }
+
+    // F-23: the shutdown cleanup below never runs after a crash or kill;
+    // purge leftover drag-out staging up front. Only `drag-out` is safe
+    // here — `staging` holds user edit-in-place data and swap journals
+    // that must survive until their recovery ran.
+    if let Ok(dir) = manifold_vfs::secure_runtime_subdir("drag-out") {
+        if dir.is_dir() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     let run_res = window.run().map_err(|e| e.to_string());
