@@ -803,6 +803,18 @@ pub fn atomic_write_bytes(path: &Path, data: &[u8]) -> std::io::Result<()> {
         let _ = fs::remove_file(&tmp_path);
         return Err(e);
     }
+    #[cfg(not(unix))]
+    {
+        // Flush the content while the write handle is still open:
+        // Windows' FlushFileBuffers requires write access, so a later
+        // read-only reopen would fail with ERROR_ACCESS_DENIED. NTFS
+        // journaling makes a separate metadata flush unnecessary here.
+        if let Err(e) = tmp.sync_all() {
+            drop(tmp);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+    }
     drop(tmp);
 
     let old_meta = fs::metadata(&final_path);
@@ -825,13 +837,18 @@ pub fn atomic_write_bytes(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
     // Flush content AND the metadata applied above to stable storage
     // before publishing the rename, so a crash can neither expose a
-    // truncated file nor lose the preserved mode/xattrs (R04).
-    let tmp = fs::File::open(&tmp_path)?;
-    if let Err(e) = tmp.sync_all() {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e);
+    // truncated file nor lose the preserved mode/xattrs (R04). This
+    // reopen-and-sync is the unix flavour; Windows already flushed the
+    // content through the write handle above.
+    #[cfg(unix)]
+    {
+        let tmp = fs::File::open(&tmp_path)?;
+        if let Err(e) = tmp.sync_all() {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+        drop(tmp);
     }
-    drop(tmp);
 
     if let Err(e) = fs::rename(&tmp_path, &final_path) {
         let _ = fs::remove_file(&tmp_path);
@@ -3300,6 +3317,7 @@ mod archive_json_tests {
 
     // ---- R04: durability failures must be observable ----
 
+    #[cfg(unix)]
     #[test]
     fn sync_dir_reports_errors_instead_of_swallowing_them() {
         let missing = std::env::temp_dir().join("manifold-sync-dir-does-not-exist-r04");
