@@ -1925,23 +1925,35 @@ impl RemoteEditStagingManager {
                 let current_bytes = fs::read(&staged.local_staging_path)?;
                 let current_hash: [u8; 32] = Sha256::digest(&current_bytes).into();
                 if current_hash != staged.last_sha256 {
-                    // F-19: refuse last-writer-wins. If the remote changed
-                    // since staging, someone else edited it — uploading
-                    // would destroy their work. Keep the local edit and
-                    // report the conflict instead.
-                    if let Ok(remote_bytes) = backend.read_bytes(&staged.remote_path) {
-                        let remote_hash: [u8; 32] = Sha256::digest(&remote_bytes).into();
-                        if remote_hash != staged.last_sha256 {
-                            return Err(VfsError::OperationFailed(
-                                staged.remote_path.clone(),
-                                format!(
-                                    "remote file changed since it was staged; upload \
-                                     aborted to protect the other edit. Your version is \
-                                     kept at {}; re-open the file to merge",
-                                    staged.local_staging_path.display()
-                                ),
-                            ));
-                        }
+                    // F-19 / R11: refuse last-writer-wins. The remote
+                    // state must be VERIFIED before uploading: a failed
+                    // verification read (network drop, permission error)
+                    // may not silently skip the check, or the upload
+                    // would destroy a concurrent edit exactly when the
+                    // connection is flaky. A vanished remote file is also
+                    // a concurrent change (someone deleted it).
+                    let remote_bytes = backend.read_bytes(&staged.remote_path).map_err(|e| {
+                        VfsError::OperationFailed(
+                            staged.remote_path.clone(),
+                            format!(
+                                "cannot verify the remote state before uploading ({e}); \
+                                     upload aborted to protect possible concurrent edits. \
+                                     Your version is kept at {}",
+                                staged.local_staging_path.display()
+                            ),
+                        )
+                    })?;
+                    let remote_hash: [u8; 32] = Sha256::digest(&remote_bytes).into();
+                    if remote_hash != staged.last_sha256 {
+                        return Err(VfsError::OperationFailed(
+                            staged.remote_path.clone(),
+                            format!(
+                                "remote file changed since it was staged; upload \
+                                 aborted to protect the other edit. Your version is \
+                                 kept at {}; re-open the file to merge",
+                                staged.local_staging_path.display()
+                            ),
+                        ));
                     }
                     backend.write_bytes(&staged.remote_path, &current_bytes)?;
                     staged.last_sha256 = current_hash;
@@ -2250,6 +2262,93 @@ mod tests {
             .unwrap();
         assert_eq!(uploaded, 1);
         assert_eq!(remote.read_bytes("/notes.txt").unwrap(), b"v2 edited");
+    }
+
+    /// Delegates to an `ArchiveBackend` but makes every `read_bytes` fail,
+    /// simulating a flaky connection during the F-19 verification read.
+    struct UnverifiableRemote {
+        inner: manifold_vfs::ArchiveBackend,
+    }
+
+    impl FileSystemBackend for UnverifiableRemote {
+        fn scheme(&self) -> &str {
+            "unverifiable"
+        }
+        fn list_directory(&self, p: &str) -> Result<Vec<FileMetadata>, VfsError> {
+            self.inner.list_directory(p)
+        }
+        fn metadata(&self, p: &str) -> Result<FileMetadata, VfsError> {
+            self.inner.metadata(p)
+        }
+        fn volume_stats(&self, p: &str) -> Result<VolumeStats, VfsError> {
+            self.inner.volume_stats(p)
+        }
+        fn create_dir(&self, p: &str) -> Result<(), VfsError> {
+            self.inner.create_dir(p)
+        }
+        fn remove(&self, p: &str, r: bool) -> Result<(), VfsError> {
+            self.inner.remove(p, r)
+        }
+        fn rename(&self, f: &str, t: &str) -> Result<(), VfsError> {
+            self.inner.rename(f, t)
+        }
+        fn copy_file(&self, f: &str, t: &str) -> Result<(), VfsError> {
+            self.inner.copy_file(f, t)
+        }
+        fn read_bytes(&self, _p: &str) -> Result<Vec<u8>, VfsError> {
+            Err(VfsError::NetworkError(
+                "simulated connection drop during verification".to_string(),
+            ))
+        }
+        fn write_bytes(&self, p: &str, d: &[u8]) -> Result<(), VfsError> {
+            self.inner.write_bytes(p, d)
+        }
+        fn set_permissions(&self, p: &str, m: u32) -> Result<(), VfsError> {
+            self.inner.set_permissions(p, m)
+        }
+        fn set_color_label(&self, p: &str, l: ColorLabel) -> Result<(), VfsError> {
+            self.inner.set_color_label(p, l)
+        }
+        fn set_hide_extension(&self, p: &str, h: bool) -> Result<(), VfsError> {
+            self.inner.set_hide_extension(p, h)
+        }
+        fn set_locked(&self, p: &str, l: bool) -> Result<(), VfsError> {
+            self.inner.set_locked(p, l)
+        }
+    }
+
+    #[test]
+    fn edit_in_place_upload_is_rejected_when_remote_state_unverifiable() {
+        // R11: the F-19 conflict check must not be skipped when the
+        // verification read itself fails — an unverifiable remote state
+        // means the upload is refused and nothing is written.
+        use manifold_vfs::{ArchiveBackend, ArchiveFormat};
+        let archive = ArchiveBackend::new("edit3.zip", ArchiveFormat::Zip);
+        archive.write_bytes("/notes.txt", b"v1").unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = RemoteEditStagingManager::new(Some(tmp.path().to_path_buf()));
+        // Stage through the working archive first.
+        let staged_path = staging
+            .stage_for_external_edit("sess-x", "/notes.txt", &archive)
+            .unwrap();
+        std::fs::write(&staged_path, b"v2 edited").unwrap();
+
+        let flaky = UnverifiableRemote { inner: archive };
+        let err = staging
+            .sync_modified_files_for_session(Some("sess-x"), &flaky)
+            .expect_err("an unverifiable remote must refuse the upload (R11)");
+        assert!(err.to_string().contains("cannot verify"), "got: {err}");
+        assert_eq!(
+            flaky.inner.read_bytes("/notes.txt").unwrap(),
+            b"v1",
+            "nothing may be written when the remote could not be verified"
+        );
+        assert_eq!(
+            std::fs::read(&staged_path).unwrap(),
+            b"v2 edited",
+            "the local edit must stay available"
+        );
     }
 
     #[test]
