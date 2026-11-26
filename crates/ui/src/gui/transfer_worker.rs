@@ -665,25 +665,38 @@ fn retired_backup_path(dst: &Path) -> PathBuf {
     parent.join(format!("{name}.manifold-old-{}-{seq}", std::process::id()))
 }
 
+/// Private, user-only (0700) directory holding two-step swap journals.
+/// Journals are deliberately NOT stored next to the swap destination:
+/// recovery must never read files an attacker could have planted in a
+/// browsed folder (R03).
+fn swap_journal_dir() -> Result<PathBuf, String> {
+    manifold_vfs::secure_runtime_subdir("swap-journals")
+        .map_err(|e| format!("Failed to prepare swap journal directory: {e}"))
+}
+
 /// Journal file for the two-step directory swap fallback (platforms without
-/// a native atomic exchange). Recovery acts strictly on journal contents,
-/// never on file-name patterns alone.
-fn swap_journal_path(parent: &Path) -> PathBuf {
+/// a native atomic exchange). Lives in [`swap_journal_dir`]; recovery acts
+/// only on structurally validated journal contents (R03).
+fn swap_journal_path(dir: &Path) -> PathBuf {
     static JOURNAL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = JOURNAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    parent.join(format!(
+    dir.join(format!(
         ".manifold-swap-journal-{}-{seq}.json",
         std::process::id()
     ))
 }
 
-/// Completes or rolls back interrupted two-step directory swaps found in
-/// `dir`, driven by the journal's recorded paths (F-35). Backups that are
-/// not referenced by a journal are never touched. Returns human-readable
+/// Completes or rolls back interrupted two-step directory swaps recorded in
+/// `journal_dir` (F-35 / R03). `journal_dir` must be the app's private
+/// runtime directory — never a user-browsed folder — and every journal is
+/// structurally validated before any rename: both paths absolute, the
+/// backup a `.manifold-old` sibling of the destination. Journals failing
+/// validation are reported and deleted without acting on them. Backups not
+/// referenced by a journal are never touched. Returns human-readable
 /// reports for the activity log.
-pub(super) fn recover_swap_journals_in(dir: &Path) -> Vec<String> {
+pub(super) fn recover_swap_journals_in(journal_dir: &Path) -> Vec<String> {
     let mut reports = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = std::fs::read_dir(journal_dir) else {
         return reports;
     };
     for entry in entries.flatten() {
@@ -710,6 +723,29 @@ pub(super) fn recover_swap_journals_in(dir: &Path) -> Vec<String> {
         };
         let dst_p = Path::new(dst);
         let bak_p = Path::new(bak);
+        // Structural contract (R03): a journal may only ever move a
+        // `.manifold-old` backup back onto its own destination sibling.
+        // Anything else is attacker-shaped or stale and never acted on.
+        let contract_ok = dst_p.is_absolute()
+            && bak_p.is_absolute()
+            && bak_p.parent() == dst_p.parent()
+            && dst_p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|dn| {
+                    bak_p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|bn| bn.starts_with(&format!("{dn}.manifold-old-")))
+                });
+        if !contract_ok {
+            reports.push(format!(
+                "Ignoring invalid swap journal {} (paths violate the swap contract)",
+                jpath.display()
+            ));
+            let _ = std::fs::remove_file(&jpath);
+            continue;
+        }
         let dst_exists = std::fs::symlink_metadata(dst_p).is_ok();
         let bak_exists = std::fs::symlink_metadata(bak_p).is_ok();
         if !dst_exists && bak_exists {
@@ -771,16 +807,21 @@ pub(super) fn swap_local_staged_into_place(part_path: &Path, dst_path: &str) -> 
             return Ok(());
         }
         // Fallback for platforms without atomic exchange (Windows):
-        // two-step rename with a visible, journaled backup.
-        let parent = dst.parent().unwrap_or(Path::new(".")).to_path_buf();
+        // two-step rename with a visible, journaled backup. The journal
+        // lives in the private runtime directory, never next to the
+        // destination (R03).
         let bak_path = retired_backup_path(dst);
-        let journal = swap_journal_path(&parent);
+        let journal_dir = swap_journal_dir()?;
+        let journal = swap_journal_path(&journal_dir);
+        let dst_abs = std::path::absolute(dst).unwrap_or_else(|_| dst.to_path_buf());
         let body = serde_json::json!({
-            "v": 1,
-            "dst": dst_path,
+            "v": 2,
+            "dst": dst_abs.to_string_lossy(),
             "bak": bak_path.to_string_lossy(),
         });
-        std::fs::write(&journal, body.to_string())
+        // Durable, atomic journal creation so a crash cannot leave a
+        // truncated (and therefore unrecoverable) journal behind (R04).
+        manifold_vfs::atomic_write_bytes(&journal, body.to_string().as_bytes())
             .map_err(|e| format!("Failed to create swap journal: {e}"))?;
         if let Err(err) = std::fs::rename(dst, &bak_path) {
             let _ = std::fs::remove_file(&journal);
@@ -1654,5 +1695,96 @@ mod staging_tests {
         let reports = recover_swap_journals_in(tmp.path());
         assert!(reports.is_empty());
         assert!(orphan.join("keep.txt").exists());
+    }
+
+    // ---- R03: journals must never be trusted by name alone ----
+
+    fn planted_journal(journal_dir: &Path, name: &str, dst: &str, bak: &str) {
+        let body = format!("{{\"v\":2,\"dst\":\"{dst}\",\"bak\":\"{bak}\"}}");
+        std::fs::write(journal_dir.join(name), body).unwrap();
+    }
+
+    #[test]
+    fn recover_rejects_journal_with_backup_outside_destination_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("folder");
+        let foreign_bak = other.path().join("folder.manifold-old-1");
+        std::fs::create_dir(&foreign_bak).unwrap();
+        std::fs::write(foreign_bak.join("data.txt"), b"precious").unwrap();
+
+        planted_journal(
+            tmp.path(),
+            ".manifold-swap-journal-999-0.json",
+            &dst.to_string_lossy(),
+            &foreign_bak.to_string_lossy(),
+        );
+        let reports = recover_swap_journals_in(tmp.path());
+        assert!(
+            reports.iter().any(|r| r.contains("invalid")),
+            "foreign backup must be reported as invalid: {reports:?}"
+        );
+        assert!(
+            !dst.exists(),
+            "an attacker journal must not create the destination"
+        );
+        assert!(
+            foreign_bak.exists(),
+            "an attacker journal must not move a foreign tree"
+        );
+    }
+
+    #[test]
+    fn recover_rejects_journal_pointing_at_unrelated_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("folder");
+        let unrelated = tmp.path().join("unrelated.txt");
+        std::fs::write(&unrelated, b"do not touch").unwrap();
+
+        planted_journal(
+            tmp.path(),
+            ".manifold-swap-journal-999-1.json",
+            &dst.to_string_lossy(),
+            &unrelated.to_string_lossy(),
+        );
+        let reports = recover_swap_journals_in(tmp.path());
+        assert!(reports.iter().any(|r| r.contains("invalid")));
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"do not touch");
+        assert!(!dst.exists());
+    }
+
+    #[test]
+    fn recover_rejects_journal_with_relative_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        planted_journal(
+            tmp.path(),
+            ".manifold-swap-journal-999-2.json",
+            "relative/folder",
+            "relative/folder.manifold-old-1",
+        );
+        let reports = recover_swap_journals_in(tmp.path());
+        assert!(reports.iter().any(|r| r.contains("invalid")));
+        assert!(!Path::new("relative/folder").exists());
+    }
+
+    #[test]
+    fn recover_still_restores_wellformed_journal() {
+        // The validation must not break legitimate recovery: a journal
+        // whose backup is a proper `.manifold-old` sibling is honoured.
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("folder");
+        let bak = tmp.path().join("folder.manifold-old-42-1");
+        std::fs::create_dir(&bak).unwrap();
+        std::fs::write(bak.join("data.txt"), b"precious").unwrap();
+        planted_journal(
+            tmp.path(),
+            ".manifold-swap-journal-999-3.json",
+            &dst.to_string_lossy(),
+            &bak.to_string_lossy(),
+        );
+
+        let reports = recover_swap_journals_in(tmp.path());
+        assert!(reports.iter().any(|r| r.contains("Recovered")));
+        assert_eq!(std::fs::read(dst.join("data.txt")).unwrap(), b"precious");
     }
 }
