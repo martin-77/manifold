@@ -656,14 +656,20 @@ fn copy_file_safely(
     let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
     let part_path = format!("{dst_path}.manifold-sync-part-{}-{seq}", std::process::id());
 
-    let total = src
-        .metadata(src_path)
-        .ok()
-        .and_then(|m| m.size)
-        .unwrap_or(0);
+    // The source must be readable to copy it; a metadata error here means
+    // the file vanished or is unreadable. Treating it as size 0 would skip
+    // staged-size validation and let a truncated copy publish unnoticed.
+    let src_meta = src.metadata(src_path).map_err(|e| err_for(relative, e))?;
+    let total = src_meta.size;
 
-    if dst.supports_chunked_io() {
+    // Stream only when BOTH sides actually benefit: the default
+    // read_range/append_bytes implementations buffer whole files, so
+    // checking only the destination turned a remote source into a full
+    // re-read per chunk (quadratic traffic) and a remote destination into
+    // read-modify-write appends.
+    if src.supports_chunked_io() && dst.supports_chunked_io() {
         let mut offset = 0u64;
+        let mut wrote_any = false;
         loop {
             let chunk = src
                 .read_range(src_path, offset, CHUNK)
@@ -673,10 +679,18 @@ fn copy_file_safely(
             }
             dst.append_bytes(&part_path, &chunk)
                 .map_err(|e| err_for(relative, e))?;
+            wrote_any = true;
             offset += chunk.len() as u64;
-            if total > 0 && offset >= total {
+            if total.is_some_and(|t| offset >= t) {
                 break;
             }
+        }
+        if !wrote_any {
+            // Empty source: the loop never appended, so stage an empty
+            // part file explicitly; otherwise publishing has nothing to
+            // rename and the copy of a 0-byte file fails (R05).
+            dst.append_bytes(&part_path, &[])
+                .map_err(|e| err_for(relative, e))?;
         }
     } else {
         let bytes = src.read_bytes(src_path).map_err(|e| err_for(relative, e))?;
@@ -684,8 +698,9 @@ fn copy_file_safely(
             .map_err(|e| err_for(relative, e))?;
     }
 
-    // Validate the staged copy before publishing it.
-    if total > 0 {
+    // Validate the staged copy against the known source size before
+    // publishing; size 0 is a real size and must match too.
+    if let Some(total) = total {
         let staged = dst
             .metadata(&part_path)
             .map_err(|e| err_for(relative, e))
@@ -1694,6 +1709,7 @@ mod tests {
         fail_create_dir: std::sync::Mutex<Vec<usize>>,
         fail_rename: std::sync::Mutex<Vec<usize>>,
         fail_remove: std::sync::Mutex<Vec<usize>>,
+        fail_metadata: std::sync::atomic::AtomicBool,
         n_create_dir: std::sync::atomic::AtomicUsize,
         n_rename: std::sync::atomic::AtomicUsize,
         n_remove: std::sync::atomic::AtomicUsize,
@@ -1706,6 +1722,7 @@ mod tests {
                 fail_create_dir: std::sync::Mutex::new(Vec::new()),
                 fail_rename: std::sync::Mutex::new(Vec::new()),
                 fail_remove: std::sync::Mutex::new(Vec::new()),
+                fail_metadata: std::sync::atomic::AtomicBool::new(false),
                 n_create_dir: std::sync::atomic::AtomicUsize::new(0),
                 n_rename: std::sync::atomic::AtomicUsize::new(0),
                 n_remove: std::sync::atomic::AtomicUsize::new(0),
@@ -1735,6 +1752,9 @@ mod tests {
             self.inner.list_directory(path)
         }
         fn metadata(&self, path: &str) -> Result<FileMetadata, VfsError> {
+            if self.fail_metadata.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Self::injected());
+            }
             self.inner.metadata(path)
         }
         fn volume_stats(&self, path: &str) -> Result<VolumeStats, VfsError> {
@@ -1997,5 +2017,143 @@ mod tests {
             right.metadata("b.txt").is_err(),
             "b.txt must not be published"
         );
+    }
+
+    // ---- R05: streaming must check the right capability and size 0 ----
+
+    /// Wraps a local backend but reports chunked I/O as unsupported and
+    /// counts whole-file reads, simulating a remote source whose default
+    /// `read_range` implementation re-reads the entire file.
+    struct CountingSrcBackend {
+        inner: manifold_vfs::LocalFsBackend,
+        n_read_bytes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingSrcBackend {
+        fn new(inner: manifold_vfs::LocalFsBackend) -> Self {
+            Self {
+                inner,
+                n_read_bytes: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl manifold_vfs::FileSystemBackend for CountingSrcBackend {
+        fn scheme(&self) -> &str {
+            "counting"
+        }
+        fn list_directory(&self, path: &str) -> Result<Vec<FileMetadata>, VfsError> {
+            self.inner.list_directory(path)
+        }
+        fn metadata(&self, path: &str) -> Result<FileMetadata, VfsError> {
+            self.inner.metadata(path)
+        }
+        fn volume_stats(&self, path: &str) -> Result<VolumeStats, VfsError> {
+            self.inner.volume_stats(path)
+        }
+        fn create_dir(&self, path: &str) -> Result<(), VfsError> {
+            self.inner.create_dir(path)
+        }
+        fn remove(&self, path: &str, recursive: bool) -> Result<(), VfsError> {
+            self.inner.remove(path, recursive)
+        }
+        fn rename(&self, from: &str, to: &str) -> Result<(), VfsError> {
+            self.inner.rename(from, to)
+        }
+        fn copy_file(&self, from: &str, to: &str) -> Result<(), VfsError> {
+            self.inner.copy_file(from, to)
+        }
+        fn read_bytes(&self, path: &str) -> Result<Vec<u8>, VfsError> {
+            self.n_read_bytes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.read_bytes(path)
+        }
+        fn supports_chunked_io(&self) -> bool {
+            false
+        }
+        fn write_bytes(&self, path: &str, data: &[u8]) -> Result<(), VfsError> {
+            self.inner.write_bytes(path, data)
+        }
+        fn set_permissions(&self, path: &str, mode: u32) -> Result<(), VfsError> {
+            self.inner.set_permissions(path, mode)
+        }
+        fn set_color_label(&self, path: &str, label: ColorLabel) -> Result<(), VfsError> {
+            self.inner.set_color_label(path, label)
+        }
+        fn set_hide_extension(&self, path: &str, hide: bool) -> Result<(), VfsError> {
+            self.inner.set_hide_extension(path, hide)
+        }
+        fn set_locked(&self, path: &str, locked: bool) -> Result<(), VfsError> {
+            self.inner.set_locked(path, locked)
+        }
+    }
+
+    #[test]
+    fn sync_buffers_once_when_source_lacks_chunked_io() {
+        let ltmp = tempfile::tempdir().unwrap();
+        let rtmp = tempfile::tempdir().unwrap();
+        let left = manifold_vfs::LocalFsBackend::with_sandbox_root(ltmp.path()).unwrap();
+        let right = manifold_vfs::LocalFsBackend::with_sandbox_root(rtmp.path()).unwrap();
+        // Larger than the 4 MiB chunk size: the old code streamed from the
+        // non-chunked source and re-read the whole file once per chunk.
+        let payload = vec![7u8; 4 * 1024 * 1024 + 1];
+        left.write_bytes("big.bin", &payload).unwrap();
+
+        let plan = plan_l2r(&left, &right);
+        let counting = CountingSrcBackend::new(
+            manifold_vfs::LocalFsBackend::with_sandbox_root(ltmp.path()).unwrap(),
+        );
+        let outcome = plan.execute(&counting, &right);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(
+            counting
+                .n_read_bytes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a source without chunked I/O must be buffered exactly once"
+        );
+        assert_eq!(right.read_bytes("big.bin").unwrap(), payload);
+    }
+
+    #[test]
+    fn sync_fails_when_source_metadata_unavailable() {
+        let ltmp = tempfile::tempdir().unwrap();
+        let rtmp = tempfile::tempdir().unwrap();
+        let left = manifold_vfs::LocalFsBackend::with_sandbox_root(ltmp.path()).unwrap();
+        let right = manifold_vfs::LocalFsBackend::with_sandbox_root(rtmp.path()).unwrap();
+        left.write_bytes("x.txt", b"content").unwrap();
+
+        let plan = plan_l2r(&left, &right);
+        let fault_src = FaultBackend::new(
+            manifold_vfs::LocalFsBackend::with_sandbox_root(ltmp.path()).unwrap(),
+        );
+        fault_src
+            .fail_metadata
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let outcome = plan.execute(&fault_src, &right);
+        assert!(
+            outcome.error.is_some(),
+            "an unreadable source must fail, not publish unvalidated"
+        );
+        assert!(
+            right.metadata("x.txt").is_err(),
+            "nothing may be published when the source size is unknown"
+        );
+    }
+
+    #[test]
+    fn sync_handles_empty_file() {
+        let ltmp = tempfile::tempdir().unwrap();
+        let rtmp = tempfile::tempdir().unwrap();
+        let left = manifold_vfs::LocalFsBackend::with_sandbox_root(ltmp.path()).unwrap();
+        let right = manifold_vfs::LocalFsBackend::with_sandbox_root(rtmp.path()).unwrap();
+        left.write_bytes("empty.txt", b"").unwrap();
+
+        let plan = plan_l2r(&left, &right);
+        let outcome = plan.execute(&left, &right);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        let meta = right.metadata("empty.txt").unwrap();
+        assert_eq!(meta.size, Some(0), "the empty file must be copied as such");
     }
 }
