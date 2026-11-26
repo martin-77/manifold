@@ -8,10 +8,11 @@ authors.workspace = true
 description = "Dual-pane GUI state store, virtualized 500k+ entry viewport, Slint declarative components, and modals for Manifold"
 
 [dependencies]
+# Feature-carrier only (see workspace comment + cargo-machete ignore):
+# enables fontique's fontconfig-dlopen for the transitive
+# yeslogic-fontconfig-sys build.
 fontique.workspace = true
-indexmap.workspace = true
 libc.workspace = true
-log.workspace = true
 manifold-config.workspace = true
 manifold-preview.workspace = true
 manifold-sync.workspace = true
@@ -25,3 +26,7 @@ slint.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 
+
+# fontique is a feature-carrier, not a code dependency (R15).
+[package.metadata.cargo-machete]
+ignored = ["fontique"]

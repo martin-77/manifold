@@ -1723,9 +1723,9 @@ export component SidebarPanel inherits Rectangle {
                         padding-bottom: 8px;
                         sb-flick := Flickable {
                             interactive: false;
-                            viewport-y <=> root.drag-sidebar-scroll-y;
-                            viewport-width: self.width;
-                            viewport-height: Math.max(
+                            content-y <=> root.drag-sidebar-scroll-y;
+                            content-width: self.width;
+                            content-height: Math.max(
                                 self.height,
                                 sb-col.preferred-height + 8px
                             );
@@ -1783,9 +1783,9 @@ export component SidebarPanel inherits Rectangle {
                                             }
                                         }
                                         scroll-event(ev) => {
-                                            sb-flick.viewport-y = Math.clamp(
-                                                sb-flick.viewport-y + ev.delta-y,
-                                                Math.min(0px, sb-flick.height - sb-flick.viewport-height),
+                                            sb-flick.content-y = Math.clamp(
+                                                sb-flick.content-y + ev.delta-y,
+                                                Math.min(0px, sb-flick.height - sb-flick.content-height),
                                                 0px
                                             );
                                             return accept;
@@ -2110,9 +2110,9 @@ export component InspectorDrawer inherits Rectangle {
                                 width: 100%;
                                 height: 100%;
                                 scroll-event(ev) => {
-                                    insp-info-flick.viewport-y = Math.clamp(
-                                        insp-info-flick.viewport-y + ev.delta-y,
-                                        Math.min(0px, insp-info-flick.height - insp-info-flick.viewport-height),
+                                    insp-info-flick.content-y = Math.clamp(
+                                        insp-info-flick.content-y + ev.delta-y,
+                                        Math.min(0px, insp-info-flick.height - insp-info-flick.content-height),
                                         0px
                                     );
                                     return accept;
@@ -2125,8 +2125,8 @@ export component InspectorDrawer inherits Rectangle {
                                 width: parent.width;
                                 height: parent.height;
                                 interactive: false;
-                                viewport-width: self.width;
-                                viewport-height: Math.max(self.height, insp-info-col.preferred-height + 8px);
+                                content-width: self.width;
+                                content-height: Math.max(self.height, insp-info-col.preferred-height + 8px);
 
                                 insp-info-col := VerticalLayout {
                                     x: 0px;
@@ -2814,9 +2814,9 @@ export component InspectorDrawer inherits Rectangle {
                                 width: 100%;
                                 height: 100%;
                                 scroll-event(ev) => {
-                                    insp-tasks-flick.viewport-y = Math.clamp(
-                                        insp-tasks-flick.viewport-y + ev.delta-y,
-                                        Math.min(0px, insp-tasks-flick.height - insp-tasks-flick.viewport-height),
+                                    insp-tasks-flick.content-y = Math.clamp(
+                                        insp-tasks-flick.content-y + ev.delta-y,
+                                        Math.min(0px, insp-tasks-flick.height - insp-tasks-flick.content-height),
                                         0px
                                     );
                                     return accept;
@@ -2829,8 +2829,8 @@ export component InspectorDrawer inherits Rectangle {
                                 width: parent.width;
                                 height: parent.height;
                                 interactive: false;
-                                viewport-width: self.width;
-                                viewport-height: Math.max(self.height, insp-tasks-col.preferred-height + 8px);
+                                content-width: self.width;
+                                content-height: Math.max(self.height, insp-tasks-col.preferred-height + 8px);
 
                                 insp-tasks-col := VerticalLayout {
                                     x: 0px;

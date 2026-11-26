@@ -9,14 +9,10 @@ description = "Directory synchronization, SHA-256/binary diff planner, and multi
 
 [dependencies]
 heck.workspace = true
-indexmap.workspace = true
-log.workspace = true
 manifold-vfs.workspace = true
 regex.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 sha2.workspace = true
-thiserror.workspace = true
 
 [dev-dependencies]
 libc.workspace = true

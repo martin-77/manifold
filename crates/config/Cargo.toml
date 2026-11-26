@@ -8,14 +8,10 @@ authors.workspace = true
 description = "Configuration schemas (connections.toml, session.toml) and OS Keyring integration (service='manifold')"
 
 [dependencies]
-indexmap.workspace = true
-log.workspace = true
 manifold-vfs.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 toml.workspace = true
-url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

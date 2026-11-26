@@ -47,12 +47,11 @@ jobs:
       - name: Build check
         run: cargo check --workspace --all-targets --locked
 
-      # Note: `-D warnings` is intentionally not enabled yet because the
-      # pre-existing baseline emits warnings (unused workspace deps, Slint
-      # viewport deprecations). New warnings must be avoided; enabling the
-      # strict gate is tracked as a separate cleanup task.
+      # R15: the warning baseline is now zero (Slint viewport-* deprecations
+      # renamed to content-*, unused dependencies removed, lints fixed at
+      # the root); `-D warnings` keeps it that way.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Tests
         run: cargo test --workspace --locked

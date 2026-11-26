@@ -119,9 +119,9 @@ pub(super) fn move_path_to_trash(vfs: &LocalFsBackend, path: &str) -> Result<Str
         #[cfg(target_os = "macos")]
         {
             let _ = (vfs, path);
-            return super::macos_native::macos_trash_item(path).map_err(|e| {
+            super::macos_native::macos_trash_item(path).map_err(|e| {
                 format!("macOS trash failed ({e}); refused the less-safe manual move to ~/.Trash")
-            });
+            })
         }
         #[cfg(not(target_os = "macos"))]
         {

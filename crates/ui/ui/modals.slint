@@ -849,7 +849,7 @@ component SyncModalCard inherits Rectangle {
             }
 
             if root.sync-preview-rows.length > 0 : ScrollView {
-                viewport-height: root.sync-preview-rows.length * 28px + 8px;
+                content-height: root.sync-preview-rows.length * 28px + 8px;
                 VerticalLayout {
                     padding: 4px;
                     spacing: 2px;
@@ -1211,7 +1211,7 @@ export component WindowOverlays inherits Rectangle {
             TouchArea {}
 
             ScrollView {
-                viewport-height: root.sibling-dropdown-items.length * 28px + 12px;
+                content-height: root.sibling-dropdown-items.length * 28px + 12px;
                 VerticalLayout {
                     padding: 6px;
                     spacing: 2px;
@@ -2389,8 +2389,8 @@ export component WindowOverlays inherits Rectangle {
                         br-rules-flick := Flickable {
                             width: 100%;
                             height: 100%;
-                            viewport-width: self.width;
-                            viewport-height: Math.max(self.height, br-rules-col.preferred-height + 16px);
+                            content-width: self.width;
+                            content-height: Math.max(self.height, br-rules-col.preferred-height + 16px);
 
                             br-rules-col := VerticalLayout {
                                 width: parent.width;
@@ -2556,8 +2556,8 @@ export component WindowOverlays inherits Rectangle {
                         br-preview-flick := Flickable {
                             width: 100%;
                             height: 100%;
-                            viewport-width: self.width;
-                            viewport-height: Math.max(self.height, br-preview-col.preferred-height + 16px);
+                            content-width: self.width;
+                            content-height: Math.max(self.height, br-preview-col.preferred-height + 16px);
 
                             br-preview-col := VerticalLayout {
                                 width: parent.width;
@@ -2844,7 +2844,7 @@ export component WindowOverlays inherits Rectangle {
                     ScrollView {
                         width: parent.width;
                         height: parent.height;
-                        viewport-height: Math.max(self.height, root.open-with-apps.length * (46px + root.font-size-delta * 1.5) + 12px);
+                        content-height: Math.max(self.height, root.open-with-apps.length * (46px + root.font-size-delta * 1.5) + 12px);
                         VerticalLayout {
                             padding: 6px;
                             spacing: 2px;
@@ -4116,7 +4116,7 @@ export component WindowOverlays inherits Rectangle {
 
                 if root.transfer-rows.length > 0 : ScrollView {
                     vertical-stretch: 1;
-                    viewport-height: root.transfer-rows.length * 76px + 8px;
+                    content-height: root.transfer-rows.length * 76px + 8px;
                     VerticalLayout {
                         spacing: 6px;
                         for tr in root.transfer-rows : TransferTaskCard {
@@ -5496,8 +5496,8 @@ export component WindowOverlays inherits Rectangle {
                 if root.inspector-has-image : ScrollView {
                     width: parent.width;
                     height: parent.height;
-                    viewport-width: Math.max(self.width, self.width * root.preview-minion-zoom);
-                    viewport-height: Math.max(self.height, self.height * root.preview-minion-zoom);
+                    content-width: Math.max(self.width, self.width * root.preview-minion-zoom);
+                    content-height: Math.max(self.height, self.height * root.preview-minion-zoom);
                     Rectangle {
                         width: Math.max(parent.width, parent.width * root.preview-minion-zoom);
                         height: Math.max(parent.height, parent.height * root.preview-minion-zoom);
@@ -5543,7 +5543,7 @@ export component WindowOverlays inherits Rectangle {
                 if !root.inspector-has-image && !root.inspector-is-dir : ScrollView {
                     width: parent.width;
                     height: parent.height;
-                    viewport-height: Math.max(self.height, minion-text-preview.preferred-height + 24px);
+                    content-height: Math.max(self.height, minion-text-preview.preferred-height + 24px);
                     VerticalLayout {
                         padding: 12px;
                         alignment: start;

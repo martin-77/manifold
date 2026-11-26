@@ -8,15 +8,10 @@ authors.workspace = true
 description = "Unified Virtual File System (VFS) trait, local filesystem, and archive virtualization for Manifold"
 
 [dependencies]
-bitflags.workspace = true
-indexmap.workspace = true
 libc.workspace = true
-log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
 thiserror.workspace = true
-url.workspace = true
 
 [dev-dependencies]
 fastrand.workspace = true

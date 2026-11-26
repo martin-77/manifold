@@ -10,6 +10,4 @@ description = "Inspector & Quick Look preview engine (syntax highlighting, image
 [dependencies]
 manifold-vfs.workspace = true
 serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
 

@@ -768,7 +768,6 @@ fn build_batch_rename_from_test(rules: &[BatchRenameRuleSlint]) -> BatchRenamer 
 fn test_v070_trash_freedesktop_trashinfo_and_no_permanent_delete_fallback() {
     let work_dir = format!("/tmp/manifold_trash_v070_{}", std::process::id());
     let _ = std::fs::remove_dir_all(&work_dir);
-    let xdg_data = format!("{work_dir}/xdg_data");
     let src_dir = format!("{work_dir}/workspace");
     std::fs::create_dir_all(&src_dir).unwrap();
     let victim = format!("{src_dir}/important note.txt");
@@ -777,6 +776,7 @@ fn test_v070_trash_freedesktop_trashinfo_and_no_permanent_delete_fallback() {
     let vfs = LocalFsBackend::new();
     #[cfg(target_os = "linux")]
     {
+        let xdg_data = format!("{work_dir}/xdg_data");
         let prev_xdg = std::env::var_os("XDG_DATA_HOME");
         std::env::set_var("XDG_DATA_HOME", &xdg_data);
         let trashed_path = move_path_to_trash(&vfs, &victim).unwrap();

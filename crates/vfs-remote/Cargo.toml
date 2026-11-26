@@ -8,17 +8,11 @@ authors.workspace = true
 description = "Remote VFS connectors (SFTP, S3, GCS, Azure, Google Drive, FTP, WebDAV, SMB), staging editor, and SSH terminal builder for Manifold"
 
 [dependencies]
-indexmap.workspace = true
-log.workspace = true
 manifold-config.workspace = true
 manifold-vfs.workspace = true
-percent-encoding.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 sha2.workspace = true
 hmac.workspace = true
-thiserror.workspace = true
-url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
