@@ -459,6 +459,70 @@ pub fn sync_dir(dir: &Path) {
     }
 }
 
+/// Atomically exchanges two existing paths of the same type on the same
+/// volume. macOS uses `renamex_np(RENAME_SWAP)`, Linux uses
+/// `renameat2(RENAME_EXCHANGE)`; both are single-syscall exchanges with no
+/// window in which the destination is missing. Returns
+/// `ErrorKind::Unsupported` on platforms without such an API (Windows) and
+/// the OS error when the exchange conditions are not met (e.g. type
+/// mismatch between the two paths).
+pub fn atomic_exchange(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let (Ok(c_from), Ok(c_to)) = (
+            CString::new(from.as_os_str().as_bytes()),
+            CString::new(to.as_os_str().as_bytes()),
+        ) else {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        };
+        #[cfg(target_os = "macos")]
+        {
+            const RENAME_SWAP: libc::c_uint = 0x0000_0002;
+            unsafe extern "C" {
+                fn renamex_np(
+                    from: *const libc::c_char,
+                    to: *const libc::c_char,
+                    flags: libc::c_uint,
+                ) -> libc::c_int;
+            }
+            // SAFETY: both C strings are NUL-terminated and live for this
+            // call; `renamex_np` only reads the paths and fails with errno
+            // when the exchange conditions are not met.
+            let rc = unsafe { renamex_np(c_from.as_ptr(), c_to.as_ptr(), RENAME_SWAP) };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+        #[cfg(target_os = "linux")]
+        {
+            const RENAME_EXCHANGE: libc::c_uint = 0x2;
+            // SAFETY: variadic syscall with valid fd arguments and
+            // NUL-terminated path pointers.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    libc::AT_FDCWD,
+                    c_from.as_ptr(),
+                    libc::AT_FDCWD,
+                    c_to.as_ptr(),
+                    RENAME_EXCHANGE,
+                )
+            };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (from, to);
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
+}
+
 /// Copies extended attributes and ACLs on macOS without copying file data.
 ///
 /// `copyfile(3)` intentionally skips `com.apple.quarantine`, so attributes

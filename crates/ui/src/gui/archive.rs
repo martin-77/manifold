@@ -320,11 +320,11 @@ pub(super) fn copy_local_dir_preserving_bundle(
 
     sanitize_macos_app_bundle(&stage_dst, cfg!(target_os = "macos"));
 
-    if dst_pb.exists() || std::fs::symlink_metadata(dst_pb).is_ok() {
-        let _ = std::fs::remove_dir_all(dst_pb);
-        let _ = std::fs::remove_file(dst_pb);
-    }
-    if let Err(e) = std::fs::rename(&stage_dst, dst_pb) {
+    // Atomically replace the destination (native exchange on unix,
+    // journaled two-step on Windows); never delete an existing target up
+    // front (F-8: the old remove_dir_all + rename window destroyed data).
+    let dst_str = dst_pb.to_string_lossy().to_string();
+    if let Err(e) = swap_local_staged_into_place(&stage_dst, &dst_str) {
         let _ = std::fs::remove_dir_all(&stage_wrap);
         return Err(format!("Failed to finalize directory copy: {e}"));
     }

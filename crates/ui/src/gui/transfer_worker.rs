@@ -655,30 +655,165 @@ fn sync_part_file_to_disk(path: &Path) {
     }
 }
 
+/// Visible (non-hidden) backup name used when a replaced tree cannot be
+/// deleted, so the user can always find and recover it.
+fn retired_backup_path(dst: &Path) -> PathBuf {
+    let parent = dst.parent().unwrap_or(Path::new("."));
+    let name = dst.file_name().and_then(|n| n.to_str()).unwrap_or("item");
+    static RETIRE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = RETIRE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    parent.join(format!("{name}.manifold-old-{}-{seq}", std::process::id()))
+}
+
+/// Journal file for the two-step directory swap fallback (platforms without
+/// a native atomic exchange). Recovery acts strictly on journal contents,
+/// never on file-name patterns alone.
+fn swap_journal_path(parent: &Path) -> PathBuf {
+    static JOURNAL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = JOURNAL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    parent.join(format!(
+        ".manifold-swap-journal-{}-{seq}.json",
+        std::process::id()
+    ))
+}
+
+/// Completes or rolls back interrupted two-step directory swaps found in
+/// `dir`, driven by the journal's recorded paths (F-35). Backups that are
+/// not referenced by a journal are never touched. Returns human-readable
+/// reports for the activity log.
+pub(super) fn recover_swap_journals_in(dir: &Path) -> Vec<String> {
+    let mut reports = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return reports;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with(".manifold-swap-journal-") || !name.ends_with(".json") {
+            continue;
+        }
+        let jpath = entry.path();
+        let Ok(raw) = std::fs::read_to_string(&jpath) else {
+            continue;
+        };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            reports.push(format!(
+                "Ignoring unreadable swap journal {}",
+                jpath.display()
+            ));
+            continue;
+        };
+        let (Some(dst), Some(bak)) = (
+            val.get("dst").and_then(|v| v.as_str()),
+            val.get("bak").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let dst_p = Path::new(dst);
+        let bak_p = Path::new(bak);
+        let dst_exists = std::fs::symlink_metadata(dst_p).is_ok();
+        let bak_exists = std::fs::symlink_metadata(bak_p).is_ok();
+        if !dst_exists && bak_exists {
+            // Crash between the two renames: roll the backup back into place.
+            match std::fs::rename(bak_p, dst_p) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&jpath);
+                    reports.push(format!(
+                        "Recovered interrupted swap: restored {}",
+                        dst_p.display()
+                    ));
+                }
+                Err(e) => reports.push(format!(
+                    "Swap recovery FAILED for {}: {e} (previous version at {})",
+                    dst_p.display(),
+                    bak_p.display()
+                )),
+            }
+        } else if dst_exists && bak_exists {
+            // Swap finished but the old tree survived cleanup: keep it
+            // visible, drop the journal.
+            reports.push(format!(
+                "Swap completed; previous version kept at {}",
+                bak_p.display()
+            ));
+            let _ = std::fs::remove_file(&jpath);
+        } else {
+            // dst present (or both gone): nothing to restore.
+            let _ = std::fs::remove_file(&jpath);
+        }
+    }
+    reports
+}
+
 pub(super) fn swap_local_staged_into_place(part_path: &Path, dst_path: &str) -> Result<(), String> {
     // Persist staged contents before the rename so a crash cannot leave a
     // truncated file at the destination (F-34). This covers paths where the
     // writer's handle is no longer available (scp/curl downloads).
     sync_part_file_to_disk(part_path);
     let dst = Path::new(dst_path);
-    if dst.is_dir() && !dst.is_symlink() {
-        let bak_path = local_part_sibling(dst_path);
-        std::fs::rename(dst, &bak_path).map_err(|e| e.to_string())?;
-        if let Err(err) = std::fs::rename(part_path, dst) {
-            let _ = std::fs::rename(&bak_path, dst);
-            let _ = std::fs::remove_dir_all(part_path);
-            let _ = std::fs::remove_file(part_path);
+    let dst_meta = std::fs::symlink_metadata(dst).ok();
+    let dst_is_real_dir = dst_meta
+        .as_ref()
+        .is_some_and(|m| m.is_dir() && !m.file_type().is_symlink());
+
+    if dst_is_real_dir {
+        // Native atomic exchange (macOS `renamex_np` / Linux `renameat2`):
+        // replaces the destination with zero window; the old tree lands at
+        // the part path afterwards and is removed, or retired to a visible
+        // name if removal fails.
+        if manifold_vfs::atomic_exchange(part_path, dst).is_ok() {
+            if std::fs::remove_dir_all(part_path).is_err() {
+                let retired = retired_backup_path(dst);
+                let _ = std::fs::rename(part_path, retired);
+            }
             if let Some(parent) = dst.parent() {
                 manifold_vfs::sync_dir(parent);
             }
+            return Ok(());
+        }
+        // Fallback for platforms without atomic exchange (Windows):
+        // two-step rename with a visible, journaled backup.
+        let parent = dst.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let bak_path = retired_backup_path(dst);
+        let journal = swap_journal_path(&parent);
+        let body = serde_json::json!({
+            "v": 1,
+            "dst": dst_path,
+            "bak": bak_path.to_string_lossy(),
+        });
+        std::fs::write(&journal, body.to_string())
+            .map_err(|e| format!("Failed to create swap journal: {e}"))?;
+        if let Err(err) = std::fs::rename(dst, &bak_path) {
+            let _ = std::fs::remove_file(&journal);
             return Err(err.to_string());
         }
+        if let Err(err) = std::fs::rename(part_path, dst) {
+            // Roll back: put the previous version back first. If even the
+            // rollback fails, surface the location of the previous version
+            // instead of hiding it.
+            if let Err(rb_err) = std::fs::rename(&bak_path, dst) {
+                return Err(format!(
+                    "{err}; rollback FAILED, previous version kept at {}; {rb_err}",
+                    bak_path.display()
+                ));
+            }
+            let _ = std::fs::remove_file(&journal);
+            let _ = std::fs::remove_dir_all(part_path);
+            let _ = std::fs::remove_file(part_path);
+            return Err(err.to_string());
+        }
+        // Success: best-effort cleanup. A failed backup removal leaves the
+        // old tree at its visible retired name.
         let _ = std::fs::remove_dir_all(&bak_path);
+        let _ = std::fs::remove_file(&journal);
         if let Some(parent) = dst.parent() {
             manifold_vfs::sync_dir(parent);
         }
         return Ok(());
     }
+
+    // File or missing target: plain rename is already atomic (it replaces
+    // an existing file on unix and via MOVEFILE_REPLACE_EXISTING on
+    // Windows).
     if let Err(err) = std::fs::rename(part_path, dst) {
         let _ = std::fs::remove_file(part_path);
         let _ = std::fs::remove_dir_all(part_path);
@@ -1414,5 +1549,110 @@ mod staging_tests {
         let f = open_exclusive_part_file(&p1).unwrap();
         drop(f);
         assert!(p1.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_exchange_swaps_two_directories_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir(&a).unwrap();
+        std::fs::create_dir(&b).unwrap();
+        std::fs::write(a.join("a.txt"), b"A").unwrap();
+        std::fs::write(b.join("b.txt"), b"B").unwrap();
+
+        manifold_vfs::atomic_exchange(&b, &a).unwrap();
+
+        assert!(a.join("b.txt").exists(), "b content moved to a");
+        assert!(b.join("a.txt").exists(), "a content moved to b");
+        assert!(!a.join("a.txt").exists());
+    }
+
+    #[test]
+    fn swap_dir_existing_keeps_no_journal_and_replaces_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("folder");
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::write(dst.join("old.txt"), b"old").unwrap();
+        let dst_str = dst.to_string_lossy().to_string();
+        let part = local_part_sibling(&dst_str);
+        std::fs::create_dir_all(&part).unwrap();
+        std::fs::write(part.join("new.txt"), b"new").unwrap();
+
+        swap_local_staged_into_place(&part, &dst_str).unwrap();
+
+        assert_eq!(std::fs::read(dst.join("new.txt")).unwrap(), b"new");
+        assert!(!dst.join("old.txt").exists());
+        let journals: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("manifold-swap-journal")
+            })
+            .collect();
+        assert!(journals.is_empty(), "journal must be removed on success");
+    }
+
+    #[test]
+    fn recover_rolls_back_interrupted_swap_from_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("folder");
+        let bak = tmp.path().join("folder.manifold-old-1");
+        std::fs::create_dir(&bak).unwrap();
+        std::fs::write(bak.join("data.txt"), b"precious").unwrap();
+        // Simulated crash between the two renames: dst missing, bak present.
+        let journal = tmp.path().join(".manifold-swap-journal-999-0.json");
+        let body = format!(
+            "{{\"v\":1,\"dst\":\"{}\",\"bak\":\"{}\"}}",
+            dst.display(),
+            bak.display()
+        );
+        std::fs::write(&journal, body).unwrap();
+
+        let reports = recover_swap_journals_in(tmp.path());
+        assert!(!reports.is_empty());
+        assert_eq!(
+            std::fs::read(dst.join("data.txt")).unwrap(),
+            b"precious",
+            "backup must be restored to the destination"
+        );
+        assert!(!journal.exists(), "journal must be consumed");
+        assert!(!bak.exists());
+    }
+
+    #[test]
+    fn recover_keeps_backup_when_dst_already_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("folder");
+        let bak = tmp.path().join("folder.manifold-old-1");
+        std::fs::create_dir(&dst).unwrap();
+        std::fs::create_dir(&bak).unwrap();
+        let journal = tmp.path().join(".manifold-swap-journal-999-1.json");
+        let body = format!(
+            "{{\"v\":1,\"dst\":\"{}\",\"bak\":\"{}\"}}",
+            dst.display(),
+            bak.display()
+        );
+        std::fs::write(&journal, body).unwrap();
+
+        let reports = recover_swap_journals_in(tmp.path());
+        assert!(reports.iter().any(|r| r.contains("kept")));
+        assert!(bak.exists(), "old tree must stay visible, not be deleted");
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn recover_never_touches_unreferenced_backups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orphan = tmp.path().join("stuff.manifold-old-7");
+        std::fs::create_dir(&orphan).unwrap();
+        std::fs::write(orphan.join("keep.txt"), b"keep").unwrap();
+
+        let reports = recover_swap_journals_in(tmp.path());
+        assert!(reports.is_empty());
+        assert!(orphan.join("keep.txt").exists());
     }
 }

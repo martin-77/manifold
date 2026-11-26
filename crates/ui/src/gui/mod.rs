@@ -5502,6 +5502,35 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
     let window = ManifoldWindow::new().map_err(|e| e.to_string())?;
     window.set_app_version_label(current_app_version_label().into());
     let rt = Rc::new(RefCell::new(GuiRuntime::new(initial_state)));
+    // Complete or roll back interrupted two-step directory swaps in the
+    // restored pane directories (F-35).
+    {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        {
+            let guard = rt.borrow();
+            for tabs in [&guard.app_state.left_tabs, &guard.app_state.right_tabs] {
+                for tab in tabs {
+                    if split_remote_uri(&tab.current_path).is_some() {
+                        continue;
+                    }
+                    let p = PathBuf::from(&tab.current_path);
+                    if p.is_dir() && !dirs.contains(&p) {
+                        dirs.push(p);
+                    }
+                }
+            }
+        }
+        let reports: Vec<String> = dirs
+            .iter()
+            .flat_map(|d| recover_swap_journals_in(d))
+            .collect();
+        if !reports.is_empty() {
+            let mut guard = rt.borrow_mut();
+            for r in reports {
+                guard.logs.push(format!("[SWAP-RECOVERY] {r}"));
+            }
+        }
+    }
     if std::env::var_os("MANIFOLD_DISABLE_UPDATE_CHECK").as_deref() != Some("1".as_ref()) {
         rt.borrow_mut().update_checking = true;
     }
