@@ -78,6 +78,42 @@ code = os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode"
 sys.exit(code)
 "#;
 
+/// F-33: attempt an ssh/scp/sftp command with `-o BatchMode=yes` so an
+/// SSH agent or key-based authentication is preferred over feeding a
+/// password through a PTY. Returns `Some(Ok(stdout))` when the batch
+/// attempt succeeded, `Some(Err)` when the command itself failed (auth
+/// was fine — retrying with a password would duplicate side effects),
+/// and `None` when the server rejected non-interactive auth and the
+/// interactive password path should run.
+fn try_batch_mode_first(cmd_vec: &[String]) -> Option<Result<Vec<u8>, VfsError>> {
+    if cmd_vec.is_empty() {
+        return None;
+    }
+    let mut batch_cmd = cmd_vec.to_vec();
+    batch_cmd.splice(1..1, ["-o".to_string(), "BatchMode=yes".to_string()]);
+    let out = Command::new(&batch_cmd[0])
+        .args(&batch_cmd[1..])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if out.status.success() {
+        return Some(Ok(out.stdout));
+    }
+    // 255 is ssh's own "authentication or transport failed" code.
+    if out.status.code() == Some(255) {
+        return None;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Some(Err(VfsError::NetworkError(if stderr.is_empty() {
+        format!(
+            "command failed with status {}",
+            out.status.code().unwrap_or(-1)
+        )
+    } else {
+        stderr
+    })))
+}
+
 /// Validates SSH/SCP host, username, and optional key path against option injection (`SEC-01`).
 pub fn validate_ssh_endpoint(
     host: &str,
@@ -317,6 +353,13 @@ impl RemoteVfsBackend {
                 _ => "none",
             }
         };
+        // F-33: prefer non-interactive authentication (SSH agent, keys)
+        // over feeding a password/passphrase through a PTY.
+        if matches!(auth_mode, "password" | "key") {
+            if let Some(res) = try_batch_mode_first(cmd_vec) {
+                return res;
+            }
+        }
         let mut child = Command::new("python3")
             .arg("-c")
             .arg(PTY_SSH_SCRIPT)
@@ -328,7 +371,17 @@ impl RemoteVfsBackend {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| VfsError::NetworkError(format!("Failed to invoke python3/ssh: {e}")))?;
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    VfsError::NetworkError(
+                        "Password-authenticated SSH requires `python3`, which is not \
+                         installed. Install Python 3 or use a key-based connection."
+                            .to_string(),
+                    )
+                } else {
+                    VfsError::NetworkError(format!("Failed to invoke python3/ssh: {e}"))
+                }
+            })?;
         if let Some(mut stdin) = child.stdin.take() {
             if auth_mode != "none" {
                 let _ = writeln!(stdin, "{secret_str}");
@@ -718,7 +771,7 @@ impl FileSystemBackend for RemoteVfsBackend {
                 ProtocolType::Sftp => {
                     let esc = norm.replace('\'', "'\\''");
                     let sh = format!(
-                        "LC_ALL=C ls -aln -- '{esc}' \
+                        "LC_ALL=C ls -abln -- '{esc}' \
                          && printf '\\n__MANIFOLD_DIRLINKS__\\n' \
                          && (cd -- '{esc}' 2>/dev/null \
                          && for f in .* *; do \
@@ -1444,6 +1497,36 @@ fn resolve_ls_owner(uid_token: &str, default_owner: &str, remote_uid: Option<u32
     }
 }
 
+/// Decodes the C-style escapes produced by `ls -b` (F-32). GNU and BSD ls
+/// both escape control characters (`\n`, `\t`, ...) and backslash (`\\`).
+fn unescape_ls_name(raw: &str) -> String {
+    if !raw.contains('\\') {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('f') => out.push('\u{0c}'),
+            Some('v') => out.push('\u{0b}'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
 pub(crate) fn parse_ls_aln_output(
     dir_norm: &str,
     raw: &str,
@@ -1495,6 +1578,9 @@ pub(crate) fn parse_ls_aln_output(
         } else {
             raw_name.to_string()
         };
+        // `ls -b` (F-32) escapes control characters and backslashes so a
+        // name can never break the line framing; decode them back.
+        let name = unescape_ls_name(&name);
         if name.is_empty() || name == "." || name == ".." {
             continue;
         }
@@ -1773,6 +1859,24 @@ impl RemoteEditStagingManager {
                 let current_bytes = fs::read(&staged.local_staging_path)?;
                 let current_hash: [u8; 32] = Sha256::digest(&current_bytes).into();
                 if current_hash != staged.last_sha256 {
+                    // F-19: refuse last-writer-wins. If the remote changed
+                    // since staging, someone else edited it — uploading
+                    // would destroy their work. Keep the local edit and
+                    // report the conflict instead.
+                    if let Ok(remote_bytes) = backend.read_bytes(&staged.remote_path) {
+                        let remote_hash: [u8; 32] = Sha256::digest(&remote_bytes).into();
+                        if remote_hash != staged.last_sha256 {
+                            return Err(VfsError::OperationFailed(
+                                staged.remote_path.clone(),
+                                format!(
+                                    "remote file changed since it was staged; upload \
+                                     aborted to protect the other edit. Your version is \
+                                     kept at {}; re-open the file to merge",
+                                    staged.local_staging_path.display()
+                                ),
+                            ));
+                        }
+                    }
                     backend.write_bytes(&staged.remote_path, &current_bytes)?;
                     staged.last_sha256 = current_hash;
                     uploaded += 1;
@@ -2022,5 +2126,106 @@ mod tests {
         assert!(smb_items
             .iter()
             .any(|i| { i.name == "Q4 Budget Report.xlsx" && !i.is_dir && i.size == Some(18432) }));
+    }
+
+    #[test]
+    fn edit_in_place_upload_is_rejected_when_remote_changed() {
+        use manifold_vfs::{ArchiveBackend, ArchiveFormat};
+        let remote = ArchiveBackend::new("edit.zip", ArchiveFormat::Zip);
+        remote.write_bytes("/config.php", b"<?php // v1").unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = RemoteEditStagingManager::new(Some(tmp.path().to_path_buf()));
+        let staged_path = staging
+            .stage_for_external_edit("sess-c", "/config.php", &remote)
+            .unwrap();
+
+        // Local edit by us and a concurrent remote edit by someone else.
+        std::fs::write(&staged_path, b"<?php // mine").unwrap();
+        remote
+            .write_bytes("/config.php", b"<?php // theirs")
+            .unwrap();
+
+        let err = staging
+            .sync_modified_files_for_session(Some("sess-c"), &remote)
+            .expect_err("must not overwrite the remote change (F-19)");
+        assert!(err.to_string().contains("changed since"), "got: {err}");
+        assert_eq!(
+            remote.read_bytes("/config.php").unwrap(),
+            b"<?php // theirs",
+            "the other edit must survive"
+        );
+        assert_eq!(
+            std::fs::read(&staged_path).unwrap(),
+            b"<?php // mine",
+            "our edit must stay available for merging"
+        );
+    }
+
+    #[test]
+    fn edit_in_place_upload_succeeds_when_remote_untouched() {
+        use manifold_vfs::{ArchiveBackend, ArchiveFormat};
+        let remote = ArchiveBackend::new("edit2.zip", ArchiveFormat::Zip);
+        remote.write_bytes("/notes.txt", b"v1").unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = RemoteEditStagingManager::new(Some(tmp.path().to_path_buf()));
+        let staged_path = staging
+            .stage_for_external_edit("sess-ok", "/notes.txt", &remote)
+            .unwrap();
+        std::fs::write(&staged_path, b"v2 edited").unwrap();
+
+        let uploaded = staging
+            .sync_modified_files_for_session(Some("sess-ok"), &remote)
+            .unwrap();
+        assert_eq!(uploaded, 1);
+        assert_eq!(remote.read_bytes("/notes.txt").unwrap(), b"v2 edited");
+    }
+
+    #[test]
+    fn ls_listing_decodes_backslash_escaped_names() {
+        // F-32: `ls -b` escapes control characters (`\n`) and backslashes
+        // (`\\`) in file names; the parser must decode them.
+        let raw = "total 8\n\
+                   -rw-r--r-- 1 0 0 5 Jan 01 10:00 report\\ncard.txt\n\
+                   -rw-r--r-- 1 0 0 1 Feb 03  2024 a\\\\b.txt\n";
+        let items = parse_ls_aln_output("/dir", raw, "u", None);
+        assert_eq!(items.len(), 2, "got: {items:?}");
+        assert_eq!(items[0].name, "report\ncard.txt");
+        assert_eq!(items[1].name, "a\\b.txt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_mode_is_preferred_over_password_pty() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let make = |name: &str, body: &str| -> String {
+            let p = dir.path().join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p.to_string_lossy().to_string()
+        };
+
+        // Succeeds only when `-o BatchMode=yes` was injected (agent auth).
+        let ok_script = make(
+            "ssh-batch-ok",
+            "for a in \"$@\"; do [ \"$a\" = \"BatchMode=yes\" ] && { echo batched; exit 0; }; done\nexit 255",
+        );
+        let res = try_batch_mode_first(&[ok_script, "user@host".into(), "ls".into()])
+            .expect("batch attempt must report")
+            .expect("batch attempt must succeed");
+        assert_eq!(String::from_utf8_lossy(&res).trim(), "batched");
+
+        // Auth rejection (ssh exit 255) falls through to the password path.
+        let always255 = make("ssh-255", "exit 255");
+        assert!(try_batch_mode_first(&[always255]).is_none());
+
+        // A command failure with working auth must NOT retry with password.
+        let fail1 = make("ssh-fail1", "echo 'remote boom' >&2\nexit 1");
+        let err = try_batch_mode_first(&[fail1])
+            .expect("must report")
+            .expect_err("command failure must surface");
+        assert!(err.to_string().contains("boom"), "got: {err}");
     }
 }

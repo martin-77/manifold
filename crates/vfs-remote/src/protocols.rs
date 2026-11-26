@@ -134,6 +134,17 @@ struct S3EndpointSpec {
 }
 
 fn resolve_s3_endpoint(profile: &ConnectionProfile) -> Result<S3EndpointSpec, VfsError> {
+    // F-31: Azure Blob uses Shared Key / Entra ID authentication, which is
+    // fundamentally different from AWS SigV4. Routing it through the S3
+    // driver only produced confusing signature errors; fail honestly.
+    if profile.protocol == ProtocolType::AzureBlob {
+        return Err(VfsError::UnsupportedOperation(
+            "Azure Blob Storage requires Shared Key/Entra authentication, which is not \
+             implemented. The S3 driver covers AWS S3, S3-compatible endpoints, and GCS \
+             interoperability HMAC keys."
+                .to_string(),
+        ));
+    }
     let bucket = profile
         .bucket
         .as_deref()
@@ -163,6 +174,17 @@ fn resolve_s3_endpoint(profile: &ConnectionProfile) -> Result<S3EndpointSpec, Vf
         .or_else(|| profile.host.as_deref().filter(|s| !s.trim().is_empty()))
         .unwrap_or("");
 
+    if raw_ep.is_empty() && profile.protocol == ProtocolType::Gcs {
+        // GCS interoperability mode speaks the S3 XML API path-style at the
+        // global endpoint with HMAC (GOOG...) access keys.
+        let host = "storage.googleapis.com".to_string();
+        return Ok(S3EndpointSpec {
+            base_url: format!("https://{host}"),
+            host_header: host,
+            bucket_prefix: format!("/{bucket}"),
+            region,
+        });
+    }
     if raw_ep.is_empty() || raw_ep.contains("amazonaws.com") {
         let host = format!("{bucket}.s3.{region}.amazonaws.com");
         Ok(S3EndpointSpec {
@@ -1804,6 +1826,46 @@ esac"#,
         );
         assert!(deleted.contains("docs/"), "marker missing: {deleted}");
         std::env::remove_var("MANIFOLD_DELETE_LOG");
+        drop(dir);
+    }
+
+    #[test]
+    fn azure_blob_is_rejected_instead_of_sigv4_misrouting() {
+        // F-31: Azure cannot speak AWS SigV4; it must fail honestly.
+        let mut profile = ConnectionProfile::new_sftp_default("az-1", "Azure");
+        profile.protocol = ProtocolType::AzureBlob;
+        profile.bucket = Some("container".to_string());
+        let err = s3_list_directory(&profile, Some("k"), "/")
+            .expect_err("Azure must be rejected up front");
+        assert!(
+            matches!(err, VfsError::UnsupportedOperation(_)),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn gcs_defaults_to_interoperability_endpoint() {
+        let _guard = curl_path_lock();
+        let log_dir = tempfile::tempdir().unwrap();
+        let log = log_dir.path().join("url.log");
+        std::env::set_var("MANIFOLD_URL_LOG", &log);
+        let dir = install_fake_curl(
+            r#"cfg=$(cat)
+printf '%s\n' "$cfg" | grep '^url = ' >> "$MANIFOLD_URL_LOG"
+printf '<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>'"#,
+        );
+        let mut profile = ConnectionProfile::new_sftp_default("gcs-1", "Google Cloud");
+        profile.protocol = ProtocolType::Gcs;
+        profile.bucket = Some("my-bucket".to_string());
+        profile.host = None;
+        profile.endpoint = None;
+        s3_list_directory(&profile, Some("goog_key"), "/").unwrap();
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            logged.contains("storage.googleapis.com/my-bucket"),
+            "GCS must route to the interoperability endpoint, got: {logged}"
+        );
+        std::env::remove_var("MANIFOLD_URL_LOG");
         drop(dir);
     }
 

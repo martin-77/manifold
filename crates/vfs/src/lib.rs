@@ -2078,51 +2078,34 @@ sys.stdout.write(json.dumps(out))
 }
 
 fn parse_archive_json_listing(raw: &str) -> Result<Vec<(String, u64, bool)>, VfsError> {
-    // Lightweight parser for `[["/path", 123, false], ...]` without extra crate deps
-    let trimmed = raw.trim();
-    if trimmed == "[]" {
-        return Ok(Vec::new());
-    }
-    let inner = trimmed
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .ok_or_else(|| VfsError::InvalidPath("Malformed archive JSON".to_string()))?;
-    let mut entries = Vec::new();
-    for item in inner.split("],") {
-        let clean = item.trim().trim_start_matches('[').trim_end_matches(']');
-        if clean.is_empty() {
-            continue;
+    // The Python lister emits a JSON array of [path, size, is_dir] triples.
+    // Parsing with serde_json (F-11) means file names containing `],`,
+    // quotes or backslashes can never break the entry framing — the old
+    // hand-rolled `split("],")` parser mis-splitted such names.
+    let value: serde_json::Value = serde_json::from_str(raw.trim())
+        .map_err(|e| VfsError::InvalidPath(format!("Malformed archive JSON: {e}")))?;
+    let items = value.as_array().ok_or_else(|| {
+        VfsError::InvalidPath("Malformed archive JSON: expected an array".to_string())
+    })?;
+    let mut entries = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let arr = item
+            .as_array()
+            .ok_or_else(|| VfsError::InvalidPath(format!("Malformed archive JSON entry {idx}")))?;
+        if arr.len() != 3 {
+            return Err(VfsError::InvalidPath(format!(
+                "Malformed archive JSON entry {idx}: expected [path, size, is_dir]"
+            )));
         }
-        let first_quote = clean
-            .find('"')
-            .ok_or_else(|| VfsError::InvalidPath("Malformed archive JSON path".to_string()))?;
-        let rest_after_first = &clean[first_quote + 1..];
-        let mut path_buf = String::new();
-        let mut escaped = false;
-        let mut end_idx = 0;
-        for (i, ch) in rest_after_first.char_indices() {
-            if escaped {
-                path_buf.push(ch);
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                end_idx = i;
-                break;
-            } else {
-                path_buf.push(ch);
-            }
+        let path = arr[0].as_str().ok_or_else(|| {
+            VfsError::InvalidPath(format!("Malformed archive JSON entry {idx}: path"))
+        })?;
+        let size = arr[1].as_u64().unwrap_or(0);
+        let is_dir = arr[2].as_bool().unwrap_or(false);
+        let norm = ArchiveBackend::normalize_virtual_path(path)?;
+        if norm != "/" {
+            entries.push((norm, size, is_dir));
         }
-        let tail = rest_after_first[end_idx + 1..]
-            .trim()
-            .trim_start_matches(',');
-        let mut parts = tail.split(',');
-        let size_str = parts.next().unwrap_or("0").trim();
-        let dir_str = parts.next().unwrap_or("false").trim();
-        let size_bytes = size_str.parse::<u64>().unwrap_or(0);
-        let is_dir = dir_str == "true";
-        let norm = ArchiveBackend::normalize_virtual_path(&path_buf)?;
-        entries.push((norm, size_bytes, is_dir));
     }
     Ok(entries)
 }
@@ -2755,5 +2738,41 @@ mod tests {
         let evil_link = sandbox_dir.join("escape_link");
         std::os::unix::fs::symlink(&outside_file, &evil_link).unwrap();
         assert!(vfs.read_bytes("escape_link").is_err());
+    }
+}
+
+#[cfg(test)]
+mod archive_json_tests {
+    use super::*;
+
+    #[test]
+    fn archive_json_listing_parser_handles_awkward_names() {
+        // F-11: a path containing "]," must parse as exactly one entry.
+        let json = r#"[["/a\"],b.txt", 5, false], ["/dir/", 0, true]]"#;
+        let out = parse_archive_json_listing(json).unwrap();
+        assert_eq!(out.len(), 2, "got: {out:?}");
+        assert_eq!(out[0].0, "/a\"],b.txt");
+        assert_eq!(out[0].1, 5);
+        assert!(!out[0].2);
+        assert_eq!(out[1].0, "/dir");
+        assert!(out[1].2);
+
+        // Unicode escapes decode correctly.
+        let json2 = r#"[["/caf\u00e9.txt", 1, false]]"#;
+        let out2 = parse_archive_json_listing(json2).unwrap();
+        assert_eq!(out2[0].0, "/café.txt");
+
+        // Empty array is valid.
+        assert!(parse_archive_json_listing("[]").unwrap().is_empty());
+
+        // Malformed input errors instead of silently producing garbage.
+        assert!(parse_archive_json_listing("{\"a\":1}").is_err());
+        assert!(parse_archive_json_listing("[[\"/x\"]]").is_err());
+        assert!(parse_archive_json_listing("not json").is_err());
+    }
+
+    #[test]
+    fn archive_json_listing_still_rejects_zip_slip() {
+        assert!(parse_archive_json_listing(r#"[["/../etc/passwd", 1, false]]"#).is_err());
     }
 }
