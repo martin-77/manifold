@@ -45,6 +45,12 @@ pub enum VfsError {
 
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
+
+    /// A composite operation (e.g. directory synchronization) failed for a
+    /// specific relative item; the first field is the item, the second the
+    /// underlying cause.
+    #[error("Operation failed for '{0}': {1}")]
+    OperationFailed(String, String),
 }
 
 /// 8-swatch Color Label tag system matching the List View dots (`doc/image1.png`)
@@ -986,6 +992,14 @@ pub trait FileSystemBackend: Send + Sync {
         Ok(all[start..end].to_vec())
     }
 
+    /// Whether chunked `read_range`/`append_bytes` I/O avoids re-reading or
+    /// buffering whole files on this backend. The local filesystem answers
+    /// `true`; remote backends default to `false` because each append costs
+    /// a full round trip.
+    fn supports_chunked_io(&self) -> bool {
+        false
+    }
+
     /// Writes `data` to `path`, creating or truncating the file.
     fn write_bytes(&self, path: &str, data: &[u8]) -> Result<(), VfsError>;
 
@@ -1580,12 +1594,11 @@ impl FileSystemBackend for LocalFsBackend {
         })?;
         if length == 0 {
             return Ok(Vec::new());
-        }
-        // Clamp to EOF first: seeking far past EOF can fail with ESPIPE/
-        // EINVAL on some platforms, and `File::take` with a huge limit would
-        // preallocate the full limit on the chunked-read path. Clamping keeps
-        // memory bounded and yields the same empty result for offsets past
-        // EOF as the trait default.
+        } // Clamp to EOF first: seeking far past EOF can fail with ESPIPE/
+          // EINVAL on some platforms, and `File::take` with a huge limit would
+          // preallocate the full limit on the chunked-read path. Clamping keeps
+          // memory bounded and yields the same empty result for offsets past
+          // EOF as the trait default.
         let file_len = file
             .metadata()
             .map(|m| m.len())
@@ -1601,6 +1614,10 @@ impl FileSystemBackend for LocalFsBackend {
             .read_to_end(&mut buf)
             .map_err(VfsError::IoError)?;
         Ok(buf)
+    }
+
+    fn supports_chunked_io(&self) -> bool {
+        true
     }
 
     fn write_bytes(&self, path: &str, data: &[u8]) -> Result<(), VfsError> {

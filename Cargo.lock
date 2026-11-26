@@ -2493,6 +2493,7 @@ version = "0.8.0"
 dependencies = [
  "heck",
  "indexmap",
+ "libc",
  "log",
  "manifold-vfs",
  "regex",

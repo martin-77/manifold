@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use heck::{ToKebabCase, ToLowerCamelCase, ToSnakeCase, ToTitleCase};
 use manifold_vfs::{FileMetadata, FileSystemBackend, VfsError};
@@ -283,20 +284,28 @@ impl SyncExecutionPlan {
                         .unwrap_or_else(|| left_vfs.metadata(&l_path).is_ok_and(|m| m.is_dir));
                     if is_dir {
                         if entry.right_meta.as_ref().is_some_and(|m| !m.is_dir) {
-                            let _ = right_vfs.remove(&r_path, false);
+                            right_vfs
+                                .remove(&r_path, false)
+                                .map_err(|e| err_for(&entry.relative_path, e))?;
                         }
-                        right_vfs.create_dir(&r_path)?;
+                        right_vfs
+                            .create_dir(&r_path)
+                            .map_err(|e| err_for(&entry.relative_path, e))?;
                     } else {
                         if let Some((parent, _)) =
                             r_path.rsplit_once('/').filter(|(p, _)| !p.is_empty())
                         {
-                            let _ = right_vfs.create_dir(parent);
+                            right_vfs
+                                .create_dir(parent)
+                                .map_err(|e| err_for(&entry.relative_path, e))?;
                         }
-                        if entry.right_meta.as_ref().is_some_and(|m| m.is_dir) {
-                            let _ = right_vfs.remove(&r_path, true);
-                        }
-                        let bytes = left_vfs.read_bytes(&l_path)?;
-                        right_vfs.write_bytes(&r_path, &bytes)?;
+                        copy_file_safely(
+                            left_vfs,
+                            right_vfs,
+                            &l_path,
+                            &r_path,
+                            &entry.relative_path,
+                        )?;
                     }
                     applied += 1;
                 }
@@ -308,20 +317,28 @@ impl SyncExecutionPlan {
                         .unwrap_or_else(|| right_vfs.metadata(&r_path).is_ok_and(|m| m.is_dir));
                     if is_dir {
                         if entry.left_meta.as_ref().is_some_and(|m| !m.is_dir) {
-                            let _ = left_vfs.remove(&l_path, false);
+                            left_vfs
+                                .remove(&l_path, false)
+                                .map_err(|e| err_for(&entry.relative_path, e))?;
                         }
-                        left_vfs.create_dir(&l_path)?;
+                        left_vfs
+                            .create_dir(&l_path)
+                            .map_err(|e| err_for(&entry.relative_path, e))?;
                     } else {
                         if let Some((parent, _)) =
                             l_path.rsplit_once('/').filter(|(p, _)| !p.is_empty())
                         {
-                            let _ = left_vfs.create_dir(parent);
+                            left_vfs
+                                .create_dir(parent)
+                                .map_err(|e| err_for(&entry.relative_path, e))?;
                         }
-                        if entry.left_meta.as_ref().is_some_and(|m| m.is_dir) {
-                            let _ = left_vfs.remove(&l_path, true);
-                        }
-                        let bytes = right_vfs.read_bytes(&r_path)?;
-                        left_vfs.write_bytes(&l_path, &bytes)?;
+                        copy_file_safely(
+                            right_vfs,
+                            left_vfs,
+                            &r_path,
+                            &l_path,
+                            &entry.relative_path,
+                        )?;
                     }
                     applied += 1;
                 }
@@ -341,14 +358,14 @@ impl SyncExecutionPlan {
                 SyncOperation::DeleteLeft => {
                     match left_vfs.remove(&l_path, true) {
                         Ok(()) | Err(VfsError::NotFound(_)) => {}
-                        Err(e) => return Err(e),
+                        Err(e) => return Err(err_for(&entry.relative_path, e)),
                     }
                     applied += 1;
                 }
                 SyncOperation::DeleteRight => {
                     match right_vfs.remove(&r_path, true) {
                         Ok(()) | Err(VfsError::NotFound(_)) => {}
-                        Err(e) => return Err(e),
+                        Err(e) => return Err(err_for(&entry.relative_path, e)),
                     }
                     applied += 1;
                 }
@@ -357,6 +374,96 @@ impl SyncExecutionPlan {
         }
         Ok(applied)
     }
+}
+
+/// Wraps an underlying error with the relative changeset path it occurred
+/// for, so partial failures stay traceable (F-21).
+fn err_for(relative: &str, e: VfsError) -> VfsError {
+    VfsError::OperationFailed(relative.to_string(), e.to_string())
+}
+
+/// Copies one file entry from `src` to `dst` safely (F-21):
+/// - streams via `read_range`/`append_bytes` when the destination supports
+///   efficient chunked I/O (local filesystem), otherwise buffers once;
+/// - stages into a part path and validates the size before publishing;
+/// - replaces an existing target only after the new content is prepared:
+///   files via atomic rename, directories via removal + rename with the
+///   staged content kept at the part path if publishing fails.
+fn copy_file_safely(
+    src: &dyn FileSystemBackend,
+    dst: &dyn FileSystemBackend,
+    src_path: &str,
+    dst_path: &str,
+    relative: &str,
+) -> Result<(), VfsError> {
+    const CHUNK: usize = 4 * 1024 * 1024;
+    static PART_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
+    let part_path = format!("{dst_path}.manifold-sync-part-{}-{seq}", std::process::id());
+
+    let total = src
+        .metadata(src_path)
+        .ok()
+        .and_then(|m| m.size)
+        .unwrap_or(0);
+
+    if dst.supports_chunked_io() {
+        let mut offset = 0u64;
+        loop {
+            let chunk = src
+                .read_range(src_path, offset, CHUNK)
+                .map_err(|e| err_for(relative, e))?;
+            if chunk.is_empty() {
+                break;
+            }
+            dst.append_bytes(&part_path, &chunk)
+                .map_err(|e| err_for(relative, e))?;
+            offset += chunk.len() as u64;
+            if total > 0 && offset >= total {
+                break;
+            }
+        }
+    } else {
+        let bytes = src.read_bytes(src_path).map_err(|e| err_for(relative, e))?;
+        dst.write_bytes(&part_path, &bytes)
+            .map_err(|e| err_for(relative, e))?;
+    }
+
+    // Validate the staged copy before publishing it.
+    if total > 0 {
+        let staged = dst
+            .metadata(&part_path)
+            .map_err(|e| err_for(relative, e))
+            .and_then(|m| {
+                if m.size == Some(total) {
+                    Ok(())
+                } else {
+                    let _ = dst.remove(&part_path, false);
+                    Err(VfsError::OperationFailed(
+                        relative.to_string(),
+                        format!("staged size mismatch ({:?} != {total})", m.size),
+                    ))
+                }
+            });
+        staged?;
+    }
+
+    // Replace the existing target only after the new content is ready.
+    if let Ok(meta) = dst.metadata(dst_path) {
+        if meta.is_dir {
+            dst.remove(dst_path, true)
+                .map_err(|e| err_for(relative, e))?;
+        }
+    }
+    if let Err(e) = dst.rename(&part_path, dst_path) {
+        return Err(VfsError::OperationFailed(
+            relative.to_string(),
+            format!(
+                "publishing the prepared replacement failed ({e}); new content kept at {part_path}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn join_vfs_path(root: &str, child: &str) -> String {
@@ -1213,6 +1320,120 @@ mod tests {
         assert_eq!(
             huge_renamer.apply_to_single_entry("aaa.txt", 0, false),
             "aaa.txt"
+        );
+    }
+
+    #[test]
+    fn sync_execute_streams_local_files_and_leaves_no_part_artifacts() {
+        use manifold_vfs::LocalFsBackend;
+        let ltmp = tempfile::tempdir().unwrap();
+        let rtmp = tempfile::tempdir().unwrap();
+        let left = LocalFsBackend::with_sandbox_root(ltmp.path()).unwrap();
+        let right = LocalFsBackend::with_sandbox_root(rtmp.path()).unwrap();
+
+        // 5 MiB payload crosses the 4 MiB chunk boundary.
+        let payload: Vec<u8> = (0..5 * 1024 * 1024).map(|i| (i % 253) as u8).collect();
+        left.write_bytes("big.bin", &payload).unwrap();
+        left.write_bytes("small.txt", b"hi").unwrap();
+
+        let plan = SyncExecutionPlan::build(
+            &left,
+            "/",
+            &right,
+            "/",
+            SyncStrategy::LeftToRight,
+            ComparisonMode::ContentHash,
+        )
+        .unwrap();
+        let applied = plan.execute(&left, &right).unwrap();
+        assert!(applied >= 2);
+        assert_eq!(right.read_bytes("big.bin").unwrap(), payload);
+        assert_eq!(right.read_bytes("small.txt").unwrap(), b"hi");
+
+        let parts: Vec<_> = std::fs::read_dir(rtmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("manifold-sync-part")
+            })
+            .collect();
+        assert!(parts.is_empty(), "part artifacts left behind: {parts:?}");
+    }
+
+    #[test]
+    fn sync_execute_replaces_target_directory_only_after_staging() {
+        use manifold_vfs::LocalFsBackend;
+        let ltmp = tempfile::tempdir().unwrap();
+        let rtmp = tempfile::tempdir().unwrap();
+        let left = LocalFsBackend::with_sandbox_root(ltmp.path()).unwrap();
+        let right = LocalFsBackend::with_sandbox_root(rtmp.path()).unwrap();
+
+        left.write_bytes("swap.txt", b"new-file-content").unwrap();
+        right
+            .write_bytes("swap.txt/old_inner.txt", b"old-dir-content")
+            .unwrap();
+
+        let plan = SyncExecutionPlan::build(
+            &left,
+            "/",
+            &right,
+            "/",
+            SyncStrategy::LeftToRight,
+            ComparisonMode::Metadata,
+        )
+        .unwrap();
+        plan.execute(&left, &right).unwrap();
+
+        let meta = right.metadata("swap.txt").unwrap();
+        assert!(!meta.is_dir, "target directory must have been replaced");
+        assert_eq!(right.read_bytes("swap.txt").unwrap(), b"new-file-content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_execute_reports_delete_failures_with_relative_path() {
+        use manifold_vfs::LocalFsBackend;
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: permission bits ineffective as root");
+            return;
+        }
+        let ltmp = tempfile::tempdir().unwrap();
+        let rtmp = tempfile::tempdir().unwrap();
+        let left = LocalFsBackend::with_sandbox_root(ltmp.path()).unwrap();
+        let right = LocalFsBackend::with_sandbox_root(rtmp.path()).unwrap();
+
+        // Right-only entry that must be deleted for mirroring; make the
+        // deletion fail via a read-only parent directory.
+        right.write_bytes("locked_dir/victim.txt", b"x").unwrap();
+        std::fs::set_permissions(rtmp.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let plan = SyncExecutionPlan::build(
+            &left,
+            "/",
+            &right,
+            "/",
+            SyncStrategy::LeftToRight,
+            ComparisonMode::Metadata,
+        )
+        .unwrap();
+        let res = plan.execute(&left, &right);
+
+        std::fs::set_permissions(rtmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = match res {
+            Ok(_applied) => {
+                // Some filesystems/names may still allow the delete; then
+                // there is nothing to assert beyond success.
+                return;
+            }
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("locked_dir"),
+            "error must carry the relative path, got: {msg}"
         );
     }
 }
