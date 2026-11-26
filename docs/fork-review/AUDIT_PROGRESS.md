@@ -20,16 +20,16 @@
 |----|---------|----------|--------------|--------|--------|
 | F-1 | `LocalFsBackend::write_bytes` truncates target non-atomically | static-path | productive (sync, remote copy, new-file) | fixed | `94fbac3` |
 | F-2 | TransferEngine rename fallback deletes existing target | static-path | **library-only** (engine unused by GUI) | fixed | `3864de3` |
-| F-3 | curl downloads truncate target on failure | static-path | partially mitigated (bg worker stages `.part`); sync remote copy path remains | open | — |
-| F-4 | S3 recursive delete removes only prefix marker | static-path | productive (S3 browse/delete) | open | — |
-| F-5 | S3 list lacks pagination (>1000 keys) | static-path | productive | open | — |
-| F-6 | WebDAV MOVE always `Overwrite: T` | static-path | productive | open | — |
+| F-3 | curl downloads truncate target on failure | static-path | partially mitigated (bg worker stages `.part`); sync remote copy path remains | fixed | `5c7ff9e` |
+| F-4 | S3 recursive delete removes only prefix marker | static-path | productive (S3 browse/delete) | fixed | `5c7ff9e` |
+| F-5 | S3 list lacks pagination (>1000 keys) | static-path | productive | fixed | `5c7ff9e` |
+| F-6 | WebDAV MOVE always `Overwrite: T` | static-path | productive | fixed | `5c7ff9e` |
 | F-7 | macOS trash without Put-Back metadata | static-path | productive | open | — |
 | F-8 | `copy_local_dir_preserving_bundle` removes target before rename | static-path | productive | fixed | `0824b8f` |
 | F-9 | `load_default` swallows TOML parse errors (config reset risk) | static-path | productive | fixed | `782a3a4` |
 | F-10 | Keychain write failures silently ignored | static-path | productive | fixed | `782a3a4` |
-| F-11 | Hand-rolled archive JSON listing parser splits on `"],"` | static-path | productive (python3 archive path) | open | — |
-| F-12 | python3 hard dependency (archive listing, SFTP PTY auth) | static-path | productive | open | — |
+| F-11 | Hand-rolled archive JSON listing parser splits on `"],"` | static-path | productive (python3 archive path) | fixed | `88cd6e6` |
+| F-12 | python3 hard dependency (archive listing, SFTP PTY auth) | static-path | productive | fixed | `88cd6e6` |
 | F-13 | Engine `read_range` chunking O(n²) | static-path | library-only (see F-13b) | fixed | `3864de3` |
 | F-13b | `LocalFsBackend` lacks `read_range` override → inspector loads whole file | static-path | productive (UI inspector) | fixed | `1e71659` |
 | F-14 | Engine ignores pause/cancel handle | static-path | library-only | fixed | `3864de3` |
@@ -37,8 +37,8 @@
 | F-16 | Preview placeholders (1920×1080, 120 s, page 1) | static-path | productive | open | — |
 | F-17 | RwLock poisoning panics (no blanket `into_inner` allowed) | static-potential | productive | open | — |
 | F-18 | Sandbox TOCTOU | static-potential | productive | open | — |
-| F-19 | Edit-in-place last-writer-wins | static-path | productive | open | — |
-| F-20 | Hand-rolled HMAC-SHA256 / `xml_unescape` order bug | static-path | productive | open | — |
+| F-19 | Edit-in-place last-writer-wins | static-path | productive | fixed | `88cd6e6` |
+| F-20 | Hand-rolled HMAC-SHA256 / `xml_unescape` order bug | static-path | productive | fixed | `5c7ff9e` |
 | F-21 | Sync engine: whole-file RAM, silent `let _ = remove()`, no rollback | static-path | productive (Cmd+Shift+Y) | fixed | `737a373` |
 | F-22 | 45 ms idle timer + polling (energy) | static-path | productive | open | — |
 | F-23 | Drag-out downloads synchronously on UI thread; staging never purged | static-path | productive | open | — |
@@ -49,9 +49,9 @@
 | F-28 | `smbclient` not present on macOS by default | static-path | productive | open | — |
 | F-29 | Config in `~/.config` on macOS (do not migrate for cosmetics) | suggestion | — | rejected (keep, per brief) | — |
 | F-30 | Quarantine handling (must NOT be removed) | n/a | — | rejected (no change, per brief) | — |
-| F-31 | GCS/Azure routed through S3 SigV4 | static-potential | productive | open | — |
-| F-32 | `ls -aln` parsing fragile | static-potential | productive | open | — |
-| F-33 | SSH agent not used (password PTY path) | static-potential | productive | open | — |
+| F-31 | GCS/Azure routed through S3 SigV4 | static-potential | productive | fixed | `88cd6e6` |
+| F-32 | `ls -aln` parsing fragile | static-potential | productive | fixed | `88cd6e6` |
+| F-33 | SSH agent not used (password PTY path) | static-potential | productive | fixed | `88cd6e6` |
 | F-34 | No fsync before swap; no directory fsync after rename | static-path | productive | fixed | `c5f6821` |
 | F-35 | Directory swap two-phase rename window; hidden `.bak` unrecoverable | static-path | productive | fixed | `0824b8f` |
 | F-36 | Part-file permissions 0600; permission copy only partial | static-path | productive | fixed | `c5f6821` |
