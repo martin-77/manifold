@@ -530,6 +530,26 @@ impl TransferEngine {
         // existing target (F-2): the previous code removed the target and
         // retried, destroying user data when the retry also failed.
         if let Err(first_err) = dst_vfs.rename(&part_path, &target_path) {
+            // The write-back fallback is only safe when the backend's
+            // write_bytes itself never destroys an existing target on
+            // failure. Remote backends truncate the destination first, so
+            // a failed fallback there would lose the previous content:
+            // refuse it and keep the staged part instead (R06).
+            if !dst_vfs.supports_atomic_replace() {
+                task.status = TransferStatus::Failed;
+                task.error_message = Some(format!(
+                    "publishing '{target_path}': rename failed ({first_err}) and this \
+                     backend does not support atomic replacement; staged copy kept at \
+                     '{part_path}'"
+                ));
+                return Err(VfsError::OperationFailed(
+                    target_path.clone(),
+                    format!(
+                        "{first_err}; backend lacks atomic write_bytes; staged copy kept \
+                         at '{part_path}'"
+                    ),
+                ));
+            }
             // Non-destructive fallback: replace the target via write_bytes
             // (crash-atomic on the local filesystem, entry-replacing in
             // archives). The part file is only removed after success.
@@ -827,6 +847,7 @@ mod tests {
         fail_write_target: Option<String>,
         read_range_calls: std::sync::atomic::AtomicUsize,
         chunked: bool,
+        atomic_replace: bool,
     }
 
     impl DelegationVfs {
@@ -837,6 +858,7 @@ mod tests {
                 fail_write_target: None,
                 read_range_calls: std::sync::atomic::AtomicUsize::new(0),
                 chunked: true,
+                atomic_replace: true,
             }
         }
     }
@@ -879,6 +901,9 @@ mod tests {
         }
         fn supports_chunked_io(&self) -> bool {
             self.chunked
+        }
+        fn supports_atomic_replace(&self) -> bool {
+            self.atomic_replace
         }
         fn write_bytes(&self, p: &str, d: &[u8]) -> Result<(), VfsError> {
             if self.fail_write_target.as_deref() == Some(p) {
@@ -1001,6 +1026,7 @@ mod tests {
             fail_write_target: None,
             read_range_calls: std::sync::atomic::AtomicUsize::new(0),
             chunked: false,
+            atomic_replace: true,
         };
         let dst_dir = tempfile::tempdir().unwrap();
         let dst = manifold_vfs::LocalFsBackend::with_sandbox_root(dst_dir.path()).unwrap();
@@ -1078,6 +1104,48 @@ mod tests {
             .expect_err("publish failure must be reported");
         assert!(err.to_string().contains("staged copy kept"), "got: {err}");
         assert_eq!(dst.read_bytes("/dst.bin").unwrap(), b"survivor");
+        let parts: Vec<_> = std::fs::read_dir(dst_dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("__manifold_part"))
+            .collect();
+        assert_eq!(parts.len(), 1, "staged part must be kept for recovery");
+    }
+
+    #[test]
+    fn engine_publish_fallback_refused_for_non_atomic_backend() {
+        // rename fails and the backend reports non-atomic write_bytes
+        // (remote-style: a failed write would truncate the target). The
+        // engine must refuse the write-back and keep the staged part
+        // instead of ever calling write_bytes on the target (R06).
+        let engine = TransferEngine::new(None);
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = manifold_vfs::LocalFsBackend::with_sandbox_root(src_dir.path()).unwrap();
+        src.write_bytes("/src.bin", &[6u8; 3072]).unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let mut dst = DelegationVfs::new(
+            manifold_vfs::LocalFsBackend::with_sandbox_root(dst_dir.path()).unwrap(),
+        );
+        dst.fail_rename = true;
+        dst.atomic_replace = false;
+        dst.inner.write_bytes("/dst.bin", b"survivor").unwrap();
+
+        let err = engine
+            .execute_task(
+                sample_task("keep-2", 1024),
+                &src,
+                &dst,
+                ConflictResolution::Replace,
+                false,
+            )
+            .expect_err("publish must fail for a non-atomic backend");
+        let msg = err.to_string();
+        assert!(msg.contains("staged copy kept"), "got: {msg}");
+        assert_eq!(
+            dst.read_bytes("/dst.bin").unwrap(),
+            b"survivor",
+            "the existing target must never be written back over"
+        );
         let parts: Vec<_> = std::fs::read_dir(dst_dir.path())
             .unwrap()
             .flatten()

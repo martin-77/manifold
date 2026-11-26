@@ -1051,6 +1051,16 @@ pub trait FileSystemBackend: Send + Sync {
         false
     }
 
+    /// Whether `write_bytes` replaces an existing target without ever
+    /// destroying it when the write itself fails: crash-atomic rename on
+    /// local filesystems, in-memory entry replacement on archives. Backends
+    /// that truncate the destination first (e.g. remote uploads) report
+    /// `false` so callers must not rely on a write-back publish fallback
+    /// to preserve the previous target (R06).
+    fn supports_atomic_replace(&self) -> bool {
+        false
+    }
+
     /// Writes `data` to `path`, creating or truncating the file.
     fn write_bytes(&self, path: &str, data: &[u8]) -> Result<(), VfsError>;
 
@@ -1752,6 +1762,12 @@ impl FileSystemBackend for LocalFsBackend {
         true
     }
 
+    fn supports_atomic_replace(&self) -> bool {
+        // atomic_write_bytes publishes via rename: an existing target is
+        // never destroyed by a failing write (R06).
+        true
+    }
+
     fn write_bytes(&self, path: &str, data: &[u8]) -> Result<(), VfsError> {
         let resolved = self.resolve_safe_path(path)?;
         self.revalidate_parent_in_sandbox(&resolved)?; // F-18
@@ -2306,6 +2322,12 @@ sys.exit(2)
 impl FileSystemBackend for ArchiveBackend {
     fn scheme(&self) -> &str {
         "archive"
+    }
+
+    fn supports_atomic_replace(&self) -> bool {
+        // Entries are replaced in-memory: a failing write never leaves a
+        // truncated entry behind (R06).
+        true
     }
 
     fn list_directory(&self, path: &str) -> Result<Vec<FileMetadata>, VfsError> {
