@@ -135,6 +135,53 @@ Corrupt-config preservation with one-time `.corrupt-<epoch>` backups and UI
 recovery notices (F-9); keyring backends report real failures instead of
 silently succeeding (F-10).
 
+### Group 6 — Transfer engine (`6a7cee3`)
+Publish fallback never deletes the existing target; single `read_bytes`
+when the source lacks chunked I/O; `execute_task_controlled` honors pause
+and cancel while keeping the part file resumable (F-2, F-13, F-14).
+
+### Group 7 — Remote protocols (`5c7ff9e`, `88cd6e6`)
+Atomic curl downloads (temp file + rename) for s3/webdav/ftp (F-3); S3
+pagination via continuation tokens (F-5) and full-tree delete with
+per-object error reporting (F-4); WebDAV `Overwrite: F` guard (F-6);
+crate-backed HMAC and single-pass XML unescape (F-20); serde_json archive
+listings (F-11); clear python3-missing error (F-12); edit-in-place refuses
+upload on concurrent remote change (F-19); Azure Blob rejected up front,
+GCS routes to the interoperability endpoint (F-31); `ls -b` listing with
+C-escape decoding (F-32); BatchMode-first auth before the password PTY
+(F-33).
+
+### Group 8 — Honest UI values (`5767099`)
+Live remote capacity via `df -kP` (SFTP) and RFC 4918 quota PROPFIND
+(WebDAV) instead of the invented 500 GB/470 GB; protocols without a
+capacity concept report `UnsupportedOperation` and the UI omits the badge
+(F-15); preview payload dimensions/page-count/duration are `Option` and
+parsed from real PNG/JPEG/GIF/WebP/PDF headers (F-16).
+
+### Group 9 — Native macOS (`58402c0`)
+Finder-aware Trash via `NSFileManager trashItemAtURL:resultingItemURL:
+error:` with Put-Back metadata (F-7); `NSPasteboard` file copy/paste
+(multi-file, native flavors) with osascript fallback (F-26); drag-out
+leak fixes (`objc_release` for `+new`/`alloc-init`) and null-class guards
+(F-27); actionable `smbclient`-missing message on macOS (F-28).
+
+### Group 10 — Performance & robustness (`cc38eff`, `570d77e`, `0d5a3c8`)
+Adaptive feedback-timer cadence (45 ms active / 250 ms idle, F-22);
+per-session drag-out staging cache + startup purge of crash leftovers
+(F-23); lock poisoning surfaces as `VfsError::PoisonedLock` instead of
+panicking (F-17); sandbox read path verifies the open descriptor's real
+path via `F_GETPATH` (F-18).
+
+## Final status (2026-11-26)
+
+All 36 audit findings are resolved: 34 fixed with regression tests (red
+before, green after), F-29/F-30 rejected per brief (config location kept,
+quarantine handling must not change). Every package was pushed only after
+`cargo fmt --check`, `cargo check`, `cargo clippy` (baseline warnings
+documented, none added) and `cargo test --workspace --locked` passed.
+`cargo deny check` passes (zero advisories; `zvariant` unmaintained
+advisory remains, no fixed release, Linux-only transitive).
+
 ## Notes for upstream review
 
 ### Engine ↔ GUI-worker consolidation analysis (F-2, F-13, F-14)
