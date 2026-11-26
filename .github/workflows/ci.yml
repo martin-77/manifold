@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main, macos-dev]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Format / Build / Lint / Test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14 # Apple Silicon (arm64)
+          - os: ubuntu-24.04
+          - os: windows-2022
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libssl-dev libdbus-1-dev libfontconfig1-dev libfreetype6-dev \
+            libx11-dev libxcb1-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Build check
+        run: cargo check --workspace --all-targets --locked
+
+      # Note: `-D warnings` is intentionally not enabled yet because the
+      # pre-existing baseline emits warnings (unused workspace deps, Slint
+      # viewport deprecations). New warnings must be avoided; enabling the
+      # strict gate is tracked as a separate cleanup task.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked
+
+      - name: Tests
+        run: cargo test --workspace --locked
+
+  deny:
+    name: cargo-deny (advisories / bans / licenses)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans advisories sources
