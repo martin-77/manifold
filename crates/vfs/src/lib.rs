@@ -444,6 +444,280 @@ pub fn current_local_civil_datetime() -> (i32, u32, u32, u32, u32) {
     system_time_to_civil(SystemTime::now())
 }
 
+/// fsyncs a directory so that a preceding `rename` is durable on unix
+/// (no-op on Windows, where NTFS journals metadata).
+pub fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    {
+        if let Ok(fd) = fs::File::open(dir) {
+            let _ = fd.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+}
+
+/// Copies extended attributes and ACLs on macOS without copying file data.
+///
+/// `copyfile(3)` intentionally skips `com.apple.quarantine`, so attributes
+/// are enumerated and copied manually (preserving Gatekeeper metadata on
+/// replacement — never removing it). ACLs are copied best-effort via
+/// `copyfile(COPYFILE_SECURITY)`.
+#[cfg(target_os = "macos")]
+fn copy_platform_metadata(from: &Path, to: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    const COPYFILE_SECURITY: libc::c_int = 0x0000_0100;
+    let (Ok(c_from), Ok(c_to)) = (
+        CString::new(from.as_os_str().as_bytes()),
+        CString::new(to.as_os_str().as_bytes()),
+    ) else {
+        return;
+    };
+    unsafe extern "C" {
+        fn copyfile(
+            from: *const libc::c_char,
+            to: *const libc::c_char,
+            state: *mut libc::c_void,
+            flags: libc::c_int,
+        ) -> libc::c_int;
+    }
+    // ACLs / security metadata (best effort).
+    unsafe {
+        let _ = copyfile(
+            c_from.as_ptr(),
+            c_to.as_ptr(),
+            std::ptr::null_mut(),
+            COPYFILE_SECURITY,
+        );
+    }
+    // All extended attributes, including com.apple.quarantine.
+    let cap = unsafe { libc::listxattr(c_from.as_ptr(), std::ptr::null_mut(), 0, 0) };
+    if cap <= 0 {
+        return;
+    }
+    let mut buf = vec![0u8; cap as usize];
+    let n = unsafe {
+        libc::listxattr(
+            c_from.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            0,
+        )
+    };
+    if n <= 0 {
+        return;
+    }
+    for name in buf[..n as usize].split(|b| *b == 0) {
+        if name.is_empty() {
+            continue;
+        }
+        let Ok(c_name) = CString::new(name.to_vec()) else {
+            continue;
+        };
+        let c_to_owned = c_to.clone();
+        let sz = unsafe {
+            libc::getxattr(
+                c_from.as_ptr(),
+                c_name.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+            )
+        };
+        if sz < 0 {
+            continue;
+        }
+        let mut val = vec![0u8; sz.max(1) as usize];
+        let got = unsafe {
+            libc::getxattr(
+                c_from.as_ptr(),
+                c_name.as_ptr(),
+                val.as_mut_ptr() as *mut libc::c_void,
+                val.len(),
+                0,
+                0,
+            )
+        };
+        if got < 0 {
+            continue;
+        }
+        val.truncate(got as usize);
+        unsafe {
+            // Per-attribute best effort: system-managed attributes may be
+            // rejected on the destination; the data write itself is valid
+            // either way.
+            let _ = libc::setxattr(
+                c_to_owned.as_ptr(),
+                c_name.as_ptr(),
+                val.as_ptr() as *const libc::c_void,
+                val.len(),
+                0,
+                0,
+            );
+        }
+    }
+}
+
+/// Copies `user.*` extended attributes on Linux. Best effort, see above.
+#[cfg(target_os = "linux")]
+fn copy_platform_metadata(from: &Path, to: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let (Ok(c_from), Ok(c_to)) = (
+        CString::new(from.as_os_str().as_bytes()),
+        CString::new(to.as_os_str().as_bytes()),
+    ) else {
+        return;
+    };
+    let cap = unsafe { libc::listxattr(c_from.as_ptr(), std::ptr::null_mut(), 0) };
+    if cap <= 0 {
+        return;
+    }
+    let mut buf = vec![0u8; cap as usize];
+    let n = unsafe {
+        libc::listxattr(
+            c_from.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+        )
+    };
+    if n <= 0 {
+        return;
+    }
+    for name in buf[..n as usize].split(|b| *b == 0) {
+        if name.is_empty() || !name.starts_with(b"user.") {
+            continue;
+        }
+        let Ok(c_name) = CString::new(name.to_vec()) else {
+            continue;
+        };
+        let c_to_owned = c_to.clone();
+        let sz =
+            unsafe { libc::getxattr(c_from.as_ptr(), c_name.as_ptr(), std::ptr::null_mut(), 0) };
+        if sz < 0 {
+            continue;
+        }
+        let mut val = vec![0u8; sz.max(1) as usize];
+        let got = unsafe {
+            libc::getxattr(
+                c_from.as_ptr(),
+                c_name.as_ptr(),
+                val.as_mut_ptr() as *mut libc::c_void,
+                val.len(),
+            )
+        };
+        if got < 0 {
+            continue;
+        }
+        val.truncate(got as usize);
+        unsafe {
+            let _ = libc::setxattr(
+                c_to_owned.as_ptr(),
+                c_name.as_ptr(),
+                val.as_ptr() as *const libc::c_void,
+                val.len(),
+                0,
+            );
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn copy_platform_metadata(_from: &Path, _to: &Path) {}
+
+/// Atomically replaces the contents of `path` with `data` via a sibling
+/// temporary file (fixes F-1: the previous `File::create` truncated the
+/// target up-front, so any failure mid-write destroyed existing data).
+///
+/// Deliberate semantics:
+/// - The temp file lives in the destination directory, so the final
+///   `rename` is atomic on the same volume (APFS, ext4/btrfs, NTFS).
+/// - Symlink write-through is preserved: if `path` is a symlink, the file
+///   it points to is replaced and the link itself stays intact. Dangling
+///   links create their target, matching the old `File::create` behaviour.
+/// - Hard links: replacing via rename unlinks the old inode, so existing
+///   hard links no longer see the new content. This differs from the old
+///   truncate-in-place behaviour and is the documented price of crash-safe
+///   replacement.
+/// - Metadata: permission bits of a pre-existing target are preserved.
+///   macOS xattrs/ACLs (including `com.apple.quarantine`) and Linux
+///   `user.*` xattrs are copied best-effort. New files default to `0644`.
+/// - Durability: the temp file is fsynced before the rename and the parent
+///   directory is fsynced afterwards (unix), so a successfully returned
+///   write survives a later crash or power loss.
+pub fn atomic_write_bytes(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let final_path = match fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => match fs::canonicalize(path) {
+            Ok(canon) => canon,
+            // Dangling symlink: create the file the link points to.
+            Err(_) => {
+                let target = fs::read_link(path)?;
+                let base = path.parent().unwrap_or(Path::new("."));
+                let joined = if target.is_absolute() {
+                    target
+                } else {
+                    base.join(target)
+                };
+                normalize_lexical(&joined)
+            }
+        },
+        _ => path.to_path_buf(),
+    };
+    let dir = final_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let file_name = final_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
+        })?;
+
+    static ATOMIC_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = ATOMIC_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = dir.join(format!(
+        ".{file_name}.manifold-tmp-{}-{seq}",
+        std::process::id()
+    ));
+
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+    let mut tmp = opts.open(&tmp_path)?;
+    if let Err(e) = tmp.write_all(data).and_then(|()| tmp.sync_all()) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    drop(tmp);
+
+    let old_meta = fs::metadata(&final_path);
+    if old_meta.is_ok() {
+        copy_platform_metadata(&final_path, &tmp_path);
+    }
+    #[cfg(unix)]
+    {
+        let mode = old_meta.map(|m| m.mode() & 0o7777).unwrap_or(0o644);
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    if let Ok(m) = &old_meta {
+        let _ = fs::set_permissions(&tmp_path, m.permissions());
+    }
+
+    if let Err(e) = fs::rename(&tmp_path, &final_path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    sync_dir(dir);
+    Ok(())
+}
+
 static SECURE_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Resolves and initializes a private per-user runtime/cache directory with `0700` permissions (`SEC-07`),
@@ -1279,9 +1553,7 @@ impl FileSystemBackend for LocalFsBackend {
                 fs::create_dir_all(parent)?;
             }
         }
-        let mut file = fs::File::create(&resolved)?;
-        file.write_all(data)?;
-        file.sync_all()?;
+        atomic_write_bytes(&resolved, data)?;
         Ok(())
     }
 
@@ -2130,6 +2402,142 @@ mod tests {
         let vfs = LocalFsBackend::with_sandbox_root(tmp.path()).unwrap();
         let err = vfs.read_range("missing.bin", 0, 16).unwrap_err();
         assert!(matches!(err, VfsError::NotFound(_)), "got {err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_bytes_fails_without_touching_target_when_staging_impossible() {
+        // Regression for F-1: the old implementation truncated the target
+        // before writing, so a failure at staging time destroyed existing
+        // data. With atomic replacement the target must stay untouched.
+        // (Deterministic fault injection: a read-only directory makes temp
+        // file creation fail while the old truncate path would succeed.)
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: permission bits ineffective as root");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("ro");
+        fs::create_dir(&dir).unwrap();
+        let file = dir.join("data.txt");
+        fs::write(&file, b"OLD").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let vfs = LocalFsBackend::with_sandbox_root(tmp.path()).unwrap();
+        let res = vfs.write_bytes("ro/data.txt", b"NEW");
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(res.is_err(), "write must fail when staging is impossible");
+        assert_eq!(fs::read(&file).unwrap(), b"OLD", "target must be intact");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_bytes_preserves_symlink_write_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vfs = LocalFsBackend::with_sandbox_root(tmp.path()).unwrap();
+        std::os::unix::fs::symlink("real.txt", tmp.path().join("link.txt")).unwrap();
+
+        vfs.write_bytes("link.txt", b"payload").unwrap();
+
+        let link_meta = fs::symlink_metadata(tmp.path().join("link.txt")).unwrap();
+        assert!(link_meta.file_type().is_symlink(), "link must stay a link");
+        assert_eq!(fs::read(tmp.path().join("real.txt")).unwrap(), b"payload");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_bytes_preserves_existing_mode_and_defaults_new_to_0644() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let vfs = LocalFsBackend::with_sandbox_root(tmp.path()).unwrap();
+
+        fs::write(tmp.path().join("exec.sh"), b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(
+            tmp.path().join("exec.sh"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        vfs.write_bytes("exec.sh", b"# updated\n").unwrap();
+        let mode = fs::metadata(tmp.path().join("exec.sh")).unwrap().mode();
+        assert_eq!(mode & 0o7777, 0o755, "existing mode must be preserved");
+
+        vfs.write_bytes("plain.txt", b"x").unwrap();
+        let mode = fs::metadata(tmp.path().join("plain.txt")).unwrap().mode();
+        assert_eq!(mode & 0o7777, 0o644, "new files default to 0644");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_bytes_leaves_no_temp_file_leftovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vfs = LocalFsBackend::with_sandbox_root(tmp.path()).unwrap();
+        vfs.write_bytes("out.bin", b"abc").unwrap();
+        vfs.write_bytes("out.bin", b"def").unwrap();
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("manifold-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp leftovers: {leftovers:?}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_write_bytes_keeps_macos_quarantine_xattr() {
+        use std::os::unix::ffi::OsStrExt;
+        // Gatekeeper metadata must survive an atomic replacement (F-1 fix
+        // must not remove quarantine, only preserve it).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("app.tar.gz");
+        fs::write(&path, b"old").unwrap();
+        let value = b"0081;00000000;test;";
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let c_name = std::ffi::CString::new("com.apple.quarantine").unwrap();
+        let rc = unsafe {
+            libc::setxattr(
+                c_path.as_ptr(),
+                c_name.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                0,
+                0,
+            )
+        };
+        if rc != 0 {
+            eprintln!("setxattr failed, skipping");
+            return;
+        }
+
+        let vfs = LocalFsBackend::with_sandbox_root(tmp.path()).unwrap();
+        vfs.write_bytes("app.tar.gz", b"new").unwrap();
+
+        let mut buf = [0u8; 64];
+        let n = unsafe {
+            libc::getxattr(
+                c_path.as_ptr(),
+                c_name.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                0,
+                0,
+            )
+        };
+        assert!(n > 0, "quarantine xattr must be preserved (rc={n})");
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn test_write_bytes_creates_missing_parent_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vfs = LocalFsBackend::with_sandbox_root(tmp.path()).unwrap();
+        vfs.write_bytes("a/b/c/deep.txt", b"deep").unwrap();
+        assert_eq!(
+            fs::read(tmp.path().join("a/b/c/deep.txt")).unwrap(),
+            b"deep"
+        );
     }
 
     #[test]
