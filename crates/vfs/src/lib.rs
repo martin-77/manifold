@@ -1198,6 +1198,76 @@ impl LocalFsBackend {
         }
     }
 
+    /// F-18: verify that an already-open file still resolves inside the
+    /// sandbox root. Uses `fcntl(F_GETPATH)` on macOS and
+    /// `/proc/self/fd` on Linux; a no-op when no sandbox is configured.
+    /// Because the check runs against the open descriptor (the truth), a
+    /// component swap between `resolve_safe_path` and the open is caught.
+    #[cfg(unix)]
+    pub fn verify_fd_in_sandbox(&self, file: &std::fs::File, path: &str) -> Result<(), VfsError> {
+        use std::os::unix::io::AsRawFd;
+        let Some(root) = &self.sandbox_root else {
+            return Ok(());
+        };
+        #[cfg(target_os = "macos")]
+        let real = {
+            let mut buf = vec![0u8; (libc::PATH_MAX + 1) as usize];
+            let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
+            if rc != 0 {
+                return Err(VfsError::InvalidPath(format!(
+                    "cannot verify sandbox containment for {path}"
+                )));
+            }
+            let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const libc::c_char) };
+            PathBuf::from(cstr.to_string_lossy().into_owned())
+        };
+        #[cfg(not(target_os = "macos"))]
+        let real = {
+            let link = format!("/proc/self/fd/{}", file.as_raw_fd());
+            fs::read_link(&link).map_err(|_| {
+                VfsError::InvalidPath(format!("cannot verify sandbox containment for {path}"))
+            })?
+        };
+        if !real.starts_with(root) {
+            return Err(VfsError::InvalidPath(format!(
+                "Resolved path {path} escapes sandbox root"
+            )));
+        }
+        Ok(())
+    }
+
+    /// F-18 (non-Unix): no `F_GETPATH` equivalent in std; containment
+    /// relies on the checks in `resolve_safe_path`. The sandbox is
+    /// currently only used by tests, so this stays a documented no-op.
+    #[cfg(not(unix))]
+    pub fn verify_fd_in_sandbox(&self, _file: &std::fs::File, _path: &str) -> Result<(), VfsError> {
+        Ok(())
+    }
+
+    /// F-18: re-check the parent directory's real path immediately before a
+    /// directory-entry operation (create/remove/rename). std exposes no
+    /// `openat`/`renameat`, so this narrows the race window rather than
+    /// closing it; the read path is fully closed via
+    /// [`LocalFsBackend::verify_fd_in_sandbox`].
+    fn revalidate_parent_in_sandbox(&self, resolved: &Path) -> Result<(), VfsError> {
+        let Some(root) = &self.sandbox_root else {
+            return Ok(());
+        };
+        let parent = resolved.parent().unwrap_or(Path::new(""));
+        if parent.as_os_str().is_empty() {
+            return Ok(());
+        }
+        if let Ok(canon) = fs::canonicalize(parent) {
+            if !canon.starts_with(root) {
+                return Err(VfsError::InvalidPath(format!(
+                    "Parent of {} escapes sandbox root",
+                    resolved.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn get_attrs(&self, path: &Path) -> Option<ExtendedItemAttributes> {
         let guard = self.attrs_overlay.read().ok()?;
         guard.get(path).cloned()
@@ -1546,6 +1616,7 @@ impl FileSystemBackend for LocalFsBackend {
 
     fn remove(&self, path: &str, recursive: bool) -> Result<(), VfsError> {
         let resolved = self.resolve_safe_path(path)?;
+        self.revalidate_parent_in_sandbox(&resolved)?; // F-18
         if let Some(attrs) = self.get_attrs(&resolved) {
             if attrs.is_locked {
                 let msg = format!("Item is locked: {}", resolved.display());
@@ -1570,6 +1641,8 @@ impl FileSystemBackend for LocalFsBackend {
     fn rename(&self, from: &str, to: &str) -> Result<(), VfsError> {
         let src = self.resolve_safe_path(from)?;
         let dst = self.resolve_safe_path(to)?;
+        self.revalidate_parent_in_sandbox(&src)?; // F-18
+        self.revalidate_parent_in_sandbox(&dst)?; // F-18
         if let Some(attrs) = self.get_attrs(&src) {
             if attrs.is_locked {
                 let msg = format!("Item is locked: {}", src.display());
@@ -1601,11 +1674,17 @@ impl FileSystemBackend for LocalFsBackend {
 
     fn read_bytes(&self, path: &str) -> Result<Vec<u8>, VfsError> {
         let resolved = self.resolve_safe_path(path)?;
-        fs::read(&resolved).map_err(|e| match e.kind() {
+        // F-18: open first, then verify the fd's real path — the check runs
+        // against the truth (the descriptor), not a re-queried path.
+        let file = fs::File::open(&resolved).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => VfsError::NotFound(path.to_string()),
             std::io::ErrorKind::PermissionDenied => VfsError::PermissionDenied(path.to_string()),
             _ => VfsError::IoError(e),
-        })
+        })?;
+        self.verify_fd_in_sandbox(&file, path)?;
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut &file, &mut buf)?;
+        Ok(buf)
     }
 
     /// Reads at most `length` bytes starting at `offset` using a positional
@@ -1620,6 +1699,8 @@ impl FileSystemBackend for LocalFsBackend {
             std::io::ErrorKind::PermissionDenied => VfsError::PermissionDenied(path.to_string()),
             _ => VfsError::IoError(e),
         })?;
+        // F-18: verify the opened fd before touching its content.
+        self.verify_fd_in_sandbox(&file, path)?;
         if length == 0 {
             return Ok(Vec::new());
         } // Clamp to EOF first: seeking far past EOF can fail with ESPIPE/
@@ -1650,6 +1731,7 @@ impl FileSystemBackend for LocalFsBackend {
 
     fn write_bytes(&self, path: &str, data: &[u8]) -> Result<(), VfsError> {
         let resolved = self.resolve_safe_path(path)?;
+        self.revalidate_parent_in_sandbox(&resolved)?; // F-18
         if let Some(attrs) = self.get_attrs(&resolved) {
             if attrs.is_locked {
                 let msg = format!("Item is locked: {}", resolved.display());
@@ -1897,7 +1979,8 @@ impl ArchiveBackend {
         }
         if let Some((parent, _)) = norm.rsplit_once('/') {
             let parent_norm = if parent.is_empty() { "/" } else { parent };
-            let has_parent = crate::lock_read(&self.entries, "archive entries")?.contains_key(parent_norm);
+            let has_parent =
+                crate::lock_read(&self.entries, "archive entries")?.contains_key(parent_norm);
             if !has_parent {
                 self.insert_metadata_only(parent_norm, 0, true)?;
             }
@@ -2714,6 +2797,37 @@ mod tests {
         assert!(avail_str.ends_with("GB") || avail_str.ends_with("MB"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn fd_containment_check_rejects_swapped_symlink() {
+        // F-18: the fd-based check must reject an open descriptor whose
+        // real path left the sandbox (the race a path re-check cannot fix).
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, b"leaked").unwrap();
+
+        let vfs = LocalFsBackend::with_sandbox_root(tmp.path()).unwrap();
+        let link = tmp.path().join("innocent.txt");
+        std::os::unix::fs::symlink(&outside_file, &link).unwrap();
+
+        // std happily follows the link; the fd check is what contains it.
+        let file = std::fs::File::open(&link).unwrap();
+        let err = vfs
+            .verify_fd_in_sandbox(&file, "innocent.txt")
+            .expect_err("fd outside the sandbox must be rejected");
+        assert!(
+            err.to_string().contains("escapes sandbox root"),
+            "got: {err}"
+        );
+
+        // A regular file inside the sandbox passes.
+        let inside = tmp.path().join("ok.txt");
+        std::fs::write(&inside, b"fine").unwrap();
+        let file = std::fs::File::open(&inside).unwrap();
+        vfs.verify_fd_in_sandbox(&file, "ok.txt").unwrap();
+    }
+
     #[test]
     fn poisoned_locks_error_instead_of_panicking() {
         // F-17: when another thread panics while holding the node lock,
@@ -2725,7 +2839,10 @@ mod tests {
             let _g = poison.write().unwrap();
             panic!("simulated panic while holding the archive lock");
         });
-        assert!(handle.join().is_err(), "poisoning thread must have panicked");
+        assert!(
+            handle.join().is_err(),
+            "poisoning thread must have panicked"
+        );
         let err = archive.list_directory("/").unwrap_err();
         assert!(
             matches!(err, VfsError::PoisonedLock(_)),
