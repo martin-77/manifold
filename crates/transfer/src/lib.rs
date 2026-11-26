@@ -340,11 +340,27 @@ impl TransferEngine {
     /// Executes a single task across `src_vfs` and `dst_vfs` using chunked I/O and conflict resolution.
     pub fn execute_task(
         &self,
+        task: TransferTask,
+        src_vfs: &dyn FileSystemBackend,
+        dst_vfs: &dyn FileSystemBackend,
+        policy: ConflictResolution,
+        apply_to_all: bool,
+    ) -> Result<TransferTask, VfsError> {
+        self.execute_task_controlled(task, src_vfs, dst_vfs, policy, apply_to_all, None)
+    }
+
+    /// Like [`Self::execute_task`], but honors a [`TransferControlHandle`]
+    /// between chunks (F-14): pause blocks until resumed or cancelled,
+    /// cancel stops the transfer and keeps the staged part file so the task
+    /// can be resumed from `transferred_bytes`.
+    pub fn execute_task_controlled(
+        &self,
         mut task: TransferTask,
         src_vfs: &dyn FileSystemBackend,
         dst_vfs: &dyn FileSystemBackend,
         policy: ConflictResolution,
         apply_to_all: bool,
+        control: Option<&TransferControlHandle>,
     ) -> Result<TransferTask, VfsError> {
         if apply_to_all && policy != ConflictResolution::Ask {
             *self.sticky_conflict_policy.lock().unwrap() = Some(policy);
@@ -412,6 +428,16 @@ impl TransferEngine {
         let part_suffix = if safe_id.is_empty() { "0" } else { &safe_id };
         let part_path = format!("{target_path}.__manifold_part_{part_suffix}");
 
+        // F-13: backends without efficient random access (default
+        // `read_range` re-reads the whole file per chunk → O(n²)) are read
+        // once and chunked from memory instead.
+        let chunked_src = src_vfs.supports_chunked_io();
+        let whole = if chunked_src {
+            None
+        } else {
+            Some(src_vfs.read_bytes(&task.source_path)?)
+        };
+
         let mut offset = task.transferred_bytes;
         if offset > 0 {
             let valid_partial = dst_vfs
@@ -429,12 +455,39 @@ impl TransferEngine {
         }
 
         while offset < task.total_bytes {
+            // F-14: honor pause/cancel between chunks.
+            if let Some(ctrl) = control {
+                if let Some(cancelled) = wait_while_paused(ctrl) {
+                    if cancelled {
+                        task.status = TransferStatus::Cancelled;
+                        // Keep the part file: `transferred_bytes` allows a
+                        // later resume; the destination was never touched.
+                        self.completed_tasks.lock().unwrap().push(task.clone());
+                        return Ok(task);
+                    }
+                }
+            }
+
             let remaining = (task.total_bytes - offset) as usize;
             let to_read = remaining.min(chunk_size);
 
             let mut attempt = 0;
             let chunk = loop {
-                match src_vfs.read_range(&task.source_path, offset, to_read) {
+                let read_res: Result<Vec<u8>, VfsError> = match &whole {
+                    Some(data) => {
+                        let start = (offset as usize).min(data.len());
+                        Ok(data[start..start.saturating_add(to_read).min(data.len())].to_vec())
+                    }
+                    None => src_vfs.read_range(&task.source_path, offset, to_read),
+                };
+                if let Some(ctrl) = control {
+                    if ctrl.is_cancelled() {
+                        task.status = TransferStatus::Cancelled;
+                        self.completed_tasks.lock().unwrap().push(task.clone());
+                        return Ok(task);
+                    }
+                }
+                match read_res {
                     Ok(bytes) => break bytes,
                     Err(err) => {
                         attempt += 1;
@@ -444,6 +497,9 @@ impl TransferEngine {
                             task.error_message = Some(err.to_string());
                             return Err(err);
                         }
+                        // Back off before retrying so a flaky source is not
+                        // hammered in a hot loop.
+                        std::thread::sleep(Duration::from_millis(50 * attempt as u64));
                     }
                 }
             };
@@ -470,19 +526,55 @@ impl TransferEngine {
             task.transferred_bytes = offset;
         }
 
-        if dst_vfs.rename(&part_path, &target_path).is_err() {
-            let _ = dst_vfs.remove(&target_path, false);
-            if let Err(err) = dst_vfs.rename(&part_path, &target_path) {
-                let _ = dst_vfs.remove(&part_path, false);
-                task.status = TransferStatus::Failed;
-                task.error_message = Some(err.to_string());
-                return Err(err);
+        // Publish the staged file. A failing rename must NEVER delete the
+        // existing target (F-2): the previous code removed the target and
+        // retried, destroying user data when the retry also failed.
+        if let Err(first_err) = dst_vfs.rename(&part_path, &target_path) {
+            // Non-destructive fallback: replace the target via write_bytes
+            // (crash-atomic on the local filesystem, entry-replacing in
+            // archives). The part file is only removed after success.
+            let staged = dst_vfs.read_bytes(&part_path);
+            match staged.and_then(|data| dst_vfs.write_bytes(&target_path, &data)) {
+                Ok(()) => {
+                    let _ = dst_vfs.remove(&part_path, false);
+                }
+                Err(e) => {
+                    task.status = TransferStatus::Failed;
+                    task.error_message = Some(format!(
+                        "publishing '{target_path}': rename failed ({first_err}), \
+                         write fallback failed ({e}); staged copy kept at '{part_path}'"
+                    ));
+                    return Err(VfsError::OperationFailed(
+                        target_path.clone(),
+                        format!("{first_err}; fallback: {e}; staged copy kept at '{part_path}'"),
+                    ));
+                }
             }
         }
         task.status = TransferStatus::Completed;
         self.completed_tasks.lock().unwrap().push(task.clone());
         Ok(task)
     }
+}
+
+/// Blocks while `ctrl` is paused. Returns `Some(true)` when the transfer
+/// was cancelled (possibly while paused), `Some(false)` when it was
+/// resumed, `None` when the handle was running all along (F-14).
+fn wait_while_paused(ctrl: &TransferControlHandle) -> Option<bool> {
+    if !ctrl.is_paused() {
+        return if ctrl.is_cancelled() {
+            Some(true)
+        } else {
+            None
+        };
+    }
+    while ctrl.is_paused() {
+        if ctrl.is_cancelled() {
+            return Some(true);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Some(ctrl.is_cancelled())
 }
 
 #[cfg(test)]
@@ -620,6 +712,11 @@ mod tests {
                 }
                 self.inner.read_range(p, offset, len)
             }
+            fn supports_chunked_io(&self) -> bool {
+                // Exercise the chunked read path despite the default being
+                // false on ArchiveBackend.
+                true
+            }
             fn write_bytes(&self, p: &str, d: &[u8]) -> Result<(), VfsError> {
                 self.inner.write_bytes(p, d)
             }
@@ -721,5 +818,271 @@ mod tests {
         limiter.set_rate(Some(1024));
         assert_eq!(limiter.consume(1024), Duration::ZERO);
         assert!(limiter.consume(1024) >= Duration::from_millis(900));
+    }
+
+    /// Configurable delegation wrapper for engine regression tests.
+    struct DelegationVfs {
+        inner: manifold_vfs::LocalFsBackend,
+        fail_rename: bool,
+        fail_write_target: Option<String>,
+        read_range_calls: std::sync::atomic::AtomicUsize,
+        chunked: bool,
+    }
+
+    impl DelegationVfs {
+        fn new(inner: manifold_vfs::LocalFsBackend) -> Self {
+            Self {
+                inner,
+                fail_rename: false,
+                fail_write_target: None,
+                read_range_calls: std::sync::atomic::AtomicUsize::new(0),
+                chunked: true,
+            }
+        }
+    }
+
+    impl FileSystemBackend for DelegationVfs {
+        fn scheme(&self) -> &str {
+            self.inner.scheme()
+        }
+        fn list_directory(&self, p: &str) -> Result<Vec<FileMetadata>, VfsError> {
+            self.inner.list_directory(p)
+        }
+        fn metadata(&self, p: &str) -> Result<FileMetadata, VfsError> {
+            self.inner.metadata(p)
+        }
+        fn volume_stats(&self, p: &str) -> Result<manifold_vfs::VolumeStats, VfsError> {
+            self.inner.volume_stats(p)
+        }
+        fn create_dir(&self, p: &str) -> Result<(), VfsError> {
+            self.inner.create_dir(p)
+        }
+        fn remove(&self, p: &str, r: bool) -> Result<(), VfsError> {
+            self.inner.remove(p, r)
+        }
+        fn rename(&self, f: &str, t: &str) -> Result<(), VfsError> {
+            if self.fail_rename {
+                return Err(VfsError::UnsupportedOperation("rename disabled".into()));
+            }
+            self.inner.rename(f, t)
+        }
+        fn copy_file(&self, f: &str, t: &str) -> Result<(), VfsError> {
+            self.inner.copy_file(f, t)
+        }
+        fn read_bytes(&self, p: &str) -> Result<Vec<u8>, VfsError> {
+            self.inner.read_bytes(p)
+        }
+        fn read_range(&self, p: &str, offset: u64, len: usize) -> Result<Vec<u8>, VfsError> {
+            self.read_range_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.read_range(p, offset, len)
+        }
+        fn supports_chunked_io(&self) -> bool {
+            self.chunked
+        }
+        fn write_bytes(&self, p: &str, d: &[u8]) -> Result<(), VfsError> {
+            if self.fail_write_target.as_deref() == Some(p) {
+                return Err(VfsError::PermissionDenied(p.to_string()));
+            }
+            self.inner.write_bytes(p, d)
+        }
+        fn append_bytes(&self, p: &str, d: &[u8]) -> Result<(), VfsError> {
+            self.inner.append_bytes(p, d)
+        }
+        fn set_permissions(&self, p: &str, m: u32) -> Result<(), VfsError> {
+            self.inner.set_permissions(p, m)
+        }
+        fn set_color_label(&self, p: &str, l: manifold_vfs::ColorLabel) -> Result<(), VfsError> {
+            self.inner.set_color_label(p, l)
+        }
+        fn set_hide_extension(&self, p: &str, h: bool) -> Result<(), VfsError> {
+            self.inner.set_hide_extension(p, h)
+        }
+        fn set_locked(&self, p: &str, l: bool) -> Result<(), VfsError> {
+            self.inner.set_locked(p, l)
+        }
+    }
+
+    fn sample_task(id: &str, chunk: usize) -> TransferTask {
+        TransferTask {
+            id: id.to_string(),
+            priority: TransferPriority::Foreground,
+            source_path: "/src.bin".to_string(),
+            destination_path: "/dst.bin".to_string(),
+            total_bytes: 3072,
+            transferred_bytes: 0,
+            chunk_size: chunk,
+            max_retries: 0,
+            status: TransferStatus::Queued,
+            error_message: None,
+        }
+    }
+
+    #[test]
+    fn engine_cancel_stops_before_touching_destination() {
+        let engine = TransferEngine::new(None);
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = manifold_vfs::LocalFsBackend::with_sandbox_root(src_dir.path()).unwrap();
+        src.write_bytes("/src.bin", &[7u8; 3072]).unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dst = manifold_vfs::LocalFsBackend::with_sandbox_root(dst_dir.path()).unwrap();
+        dst.write_bytes("/dst.bin", b"precious").unwrap();
+
+        let ctrl = TransferControlHandle::new();
+        ctrl.cancel();
+        let done = engine
+            .execute_task_controlled(
+                sample_task("cancel-1", 1024),
+                &src,
+                &dst,
+                ConflictResolution::Replace,
+                false,
+                Some(&ctrl),
+            )
+            .unwrap();
+        assert_eq!(done.status, TransferStatus::Cancelled);
+        assert_eq!(
+            dst.read_bytes("/dst.bin").unwrap(),
+            b"precious",
+            "cancelled transfer must not modify the destination"
+        );
+    }
+
+    #[test]
+    fn engine_pause_blocks_until_resume_then_completes() {
+        let engine = TransferEngine::new(None);
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = manifold_vfs::LocalFsBackend::with_sandbox_root(src_dir.path()).unwrap();
+        src.write_bytes("/src.bin", &[9u8; 3072]).unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dst = manifold_vfs::LocalFsBackend::with_sandbox_root(dst_dir.path()).unwrap();
+
+        let ctrl = TransferControlHandle::new();
+        ctrl.pause();
+        let releaser = {
+            let c = ctrl.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(120));
+                c.resume();
+            })
+        };
+        let started = Instant::now();
+        let done = engine
+            .execute_task_controlled(
+                sample_task("pause-1", 1024),
+                &src,
+                &dst,
+                ConflictResolution::Replace,
+                false,
+                Some(&ctrl),
+            )
+            .unwrap();
+        let blocked_for = started.elapsed();
+        releaser.join().unwrap();
+        assert_eq!(done.status, TransferStatus::Completed);
+        assert!(
+            blocked_for >= Duration::from_millis(100),
+            "pause must have blocked the transfer (blocked {blocked_for:?})"
+        );
+        assert_eq!(dst.read_bytes("/dst.bin").unwrap(), vec![9u8; 3072]);
+    }
+
+    #[test]
+    fn engine_buffers_once_for_backends_without_chunked_io() {
+        // F-13: default read_range re-reads the whole file per chunk (O(n²));
+        // the engine must detect this and read the source exactly once.
+        let engine = TransferEngine::new(None);
+        let src_dir = tempfile::tempdir().unwrap();
+        let src_inner = manifold_vfs::LocalFsBackend::with_sandbox_root(src_dir.path()).unwrap();
+        src_inner.write_bytes("/src.bin", &[3u8; 3072]).unwrap();
+        let src = DelegationVfs {
+            inner: src_inner,
+            fail_rename: false,
+            fail_write_target: None,
+            read_range_calls: std::sync::atomic::AtomicUsize::new(0),
+            chunked: false,
+        };
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dst = manifold_vfs::LocalFsBackend::with_sandbox_root(dst_dir.path()).unwrap();
+
+        let done = engine
+            .execute_task(
+                sample_task("chunkless-1", 1024),
+                &src,
+                &dst,
+                ConflictResolution::Replace,
+                false,
+            )
+            .unwrap();
+        assert_eq!(done.status, TransferStatus::Completed);
+        assert_eq!(dst.read_bytes("/dst.bin").unwrap(), vec![3u8; 3072]);
+        assert_eq!(
+            src.read_range_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "non-chunked backends must not be hammered with read_range"
+        );
+    }
+
+    #[test]
+    fn engine_rename_failure_falls_back_to_write_without_deleting_target() {
+        // F-2: rename failure used to remove the existing target first.
+        let engine = TransferEngine::new(None);
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = manifold_vfs::LocalFsBackend::with_sandbox_root(src_dir.path()).unwrap();
+        src.write_bytes("/src.bin", &[5u8; 3072]).unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let mut dst = DelegationVfs::new(
+            manifold_vfs::LocalFsBackend::with_sandbox_root(dst_dir.path()).unwrap(),
+        );
+        dst.fail_rename = true;
+        dst.inner.write_bytes("/dst.bin", b"old-content").unwrap();
+
+        let done = engine
+            .execute_task(
+                sample_task("fallback-1", 1024),
+                &src,
+                &dst,
+                ConflictResolution::Replace,
+                false,
+            )
+            .unwrap();
+        assert_eq!(done.status, TransferStatus::Completed);
+        assert_eq!(dst.read_bytes("/dst.bin").unwrap(), vec![5u8; 3072]);
+    }
+
+    #[test]
+    fn engine_publish_failure_keeps_target_and_staged_part() {
+        // Both rename and the write fallback fail: the existing target must
+        // survive untouched and the staged part must stay recoverable.
+        let engine = TransferEngine::new(None);
+        let src_dir = tempfile::tempdir().unwrap();
+        let src = manifold_vfs::LocalFsBackend::with_sandbox_root(src_dir.path()).unwrap();
+        src.write_bytes("/src.bin", &[6u8; 3072]).unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let mut dst = DelegationVfs::new(
+            manifold_vfs::LocalFsBackend::with_sandbox_root(dst_dir.path()).unwrap(),
+        );
+        dst.fail_rename = true;
+        dst.fail_write_target = Some("/dst.bin".to_string());
+        dst.inner.write_bytes("/dst.bin", b"survivor").unwrap();
+
+        let err = engine
+            .execute_task(
+                sample_task("keep-1", 1024),
+                &src,
+                &dst,
+                ConflictResolution::Replace,
+                false,
+            )
+            .expect_err("publish failure must be reported");
+        assert!(err.to_string().contains("staged copy kept"), "got: {err}");
+        assert_eq!(dst.read_bytes("/dst.bin").unwrap(), b"survivor");
+        let parts: Vec<_> = std::fs::read_dir(dst_dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("__manifold_part"))
+            .collect();
+        assert_eq!(parts.len(), 1, "staged part must be kept for recovery");
     }
 }

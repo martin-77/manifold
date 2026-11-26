@@ -19,7 +19,7 @@
 | ID | Summary | Evidence | Reachability | Status | Commit |
 |----|---------|----------|--------------|--------|--------|
 | F-1 | `LocalFsBackend::write_bytes` truncates target non-atomically | static-path | productive (sync, remote copy, new-file) | fixed | `94fbac3` |
-| F-2 | TransferEngine rename fallback deletes existing target | static-path | **library-only** (engine unused by GUI) | open | — |
+| F-2 | TransferEngine rename fallback deletes existing target | static-path | **library-only** (engine unused by GUI) | fixed | `3864de3` |
 | F-3 | curl downloads truncate target on failure | static-path | partially mitigated (bg worker stages `.part`); sync remote copy path remains | open | — |
 | F-4 | S3 recursive delete removes only prefix marker | static-path | productive (S3 browse/delete) | open | — |
 | F-5 | S3 list lacks pagination (>1000 keys) | static-path | productive | open | — |
@@ -30,9 +30,9 @@
 | F-10 | Keychain write failures silently ignored | static-path | productive | fixed | `782a3a4` |
 | F-11 | Hand-rolled archive JSON listing parser splits on `"],"` | static-path | productive (python3 archive path) | open | — |
 | F-12 | python3 hard dependency (archive listing, SFTP PTY auth) | static-path | productive | open | — |
-| F-13 | Engine `read_range` chunking O(n²) | static-path | library-only (see F-13b) | open | — |
+| F-13 | Engine `read_range` chunking O(n²) | static-path | library-only (see F-13b) | fixed | `3864de3` |
 | F-13b | `LocalFsBackend` lacks `read_range` override → inspector loads whole file | static-path | productive (UI inspector) | fixed | `1e71659` |
-| F-14 | Engine ignores pause/cancel handle | static-path | library-only | open | — |
+| F-14 | Engine ignores pause/cancel handle | static-path | library-only | fixed | `3864de3` |
 | F-15 | Fake remote volume stats (500 GB/470 GB) | static-path | productive | open | — |
 | F-16 | Preview placeholders (1920×1080, 120 s, page 1) | static-path | productive | open | — |
 | F-17 | RwLock poisoning panics (no blanket `into_inner` allowed) | static-potential | productive | open | — |
@@ -136,6 +136,26 @@ recovery notices (F-9); keyring backends report real failures instead of
 silently succeeding (F-10).
 
 ## Notes for upstream review
+
+### Engine ↔ GUI-worker consolidation analysis (F-2, F-13, F-14)
+
+`manifold_transfer::TransferEngine::execute_task` is **library-only**: the
+GUI never calls it. The GUI's background worker
+(`crates/ui/src/gui/transfer_worker.rs`) implements its own `.part`
+staging, control-handle checks and swap logic — a deliberate improvement
+over the engine at the time, but now duplicated knowledge. The engine fixes
+in this group mirror the worker's guarantees (staged part files,
+non-destructive publish, pause/cancel) so both paths are safe; a full
+consolidation (worker delegates queueing + byte moving to the engine,
+keeps UI events) is recommended as a follow-up refactor, not part of this
+hardening pass, because it would mix behavior change with risk fix-up.
+
+- **F-2:** engine rename fallback no longer deletes the existing target;
+  on publish failure the staged part is kept and the error names it.
+- **F-13:** engine reads non-chunked backends once instead of calling the
+  default whole-file `read_range` per chunk (was O(n²)).
+- **F-14:** `execute_task_controlled` honors pause (blocks between chunks)
+  and cancel (keeps the part file for resume from `transferred_bytes`).
 
 - B2 semantics: hard links to the target are broken by the rename-based
   atomic write (documented in code); macOS xattrs are copied manually
