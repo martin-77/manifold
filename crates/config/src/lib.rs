@@ -62,14 +62,15 @@ fn preserve_corrupt_config(path: &Path) -> Option<PathBuf> {
     if let Ok(entries) = fs::read_dir(parent) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(&file_name) && name.contains(".corrupt-") {
-                if fs::read(entry.path()).ok().as_deref() == Some(raw.as_slice()) {
-                    // Identical content already preserved: drop the current
-                    // copy so the fresh default can be saved without
-                    // clobbering anything.
-                    let _ = fs::remove_file(path);
-                    return Some(entry.path());
-                }
+            if name.starts_with(&file_name)
+                && name.contains(".corrupt-")
+                && fs::read(entry.path()).ok().as_deref() == Some(raw.as_slice())
+            {
+                // Identical content already preserved: drop the current
+                // copy so the fresh default can be saved without
+                // clobbering anything.
+                let _ = fs::remove_file(path);
+                return Some(entry.path());
             }
         }
     }

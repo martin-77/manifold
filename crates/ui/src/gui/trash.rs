@@ -109,6 +109,14 @@ pub(super) fn move_path_to_trash(vfs: &LocalFsBackend, path: &str) -> Result<Str
     }
     #[cfg(not(windows))]
     {
+        // F-7: on macOS prefer the native Finder-aware trash, which records
+        // the Put-Back metadata a manual rename to ~/.Trash cannot.
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(final_path) = super::macos_native::macos_trash_item(path) {
+                return Ok(final_path);
+            }
+        }
         let home = std::env::var("HOME")
             .ok()
             .filter(|h| !h.trim().is_empty())

@@ -1323,6 +1323,22 @@ fn run_smbclient_cmd(
     let out_res = cmd.output();
     let _ = fs::remove_file(&auth_path);
     let out = out_res.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            if cfg!(target_os = "macos") {
+                // F-28: macOS ships no smbclient; point at the two real
+                // options instead of a generic install hint.
+                return VfsError::UnsupportedOperation(
+                    "SMB browsing needs `smbclient`, which macOS does not ship. Either \
+                     mount the share in Finder (Finder ▸ Go ▸ Connect to Server ▸ \
+                     smb://server/share) and open it under /Volumes, or install Samba \
+                     with `brew install samba`."
+                        .to_string(),
+                );
+            }
+            return VfsError::UnsupportedOperation(
+                "SMB browsing needs `smbclient`; install the samba-client package.".to_string(),
+            );
+        }
         VfsError::NetworkError(format!(
             "Failed to run smbclient (ensure samba-client is installed): {e}"
         ))

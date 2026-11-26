@@ -51,6 +51,11 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace --locked
+        env:
+          # Opt-in for tests that touch user session state (macOS
+          # pasteboard/Trash). CI runners are ephemeral, so this is safe
+          # there and skipped on developer machines.
+          MANIFOLD_TEST_ALLOW_SESSION_STATE: 1
 
   deny:
     name: cargo-deny (advisories / bans / licenses)

@@ -158,6 +158,14 @@ pub(super) fn copy_files_to_os_clipboard(paths: &[String]) {
         return;
     }
     if cfg!(target_os = "macos") {
+        // F-26: native NSPasteboard first — proper fileURL flavor, multiple
+        // files, no Apple Events round trip; osascript remains the fallback.
+        #[cfg(target_os = "macos")]
+        {
+            if super::macos_native::macos_pasteboard_write_file_urls(&local_paths) {
+                return;
+            }
+        }
         let items: Vec<String> = local_paths
             .iter()
             .map(|p| {
@@ -202,6 +210,20 @@ pub(super) fn copy_files_to_os_clipboard(paths: &[String]) {
 
 pub(super) fn read_files_from_os_clipboard() -> Vec<String> {
     if cfg!(target_os = "macos") {
+        // F-26: native read first; supports multiple files, unlike the
+        // single-«class furl» AppleScript conversion below.
+        #[cfg(target_os = "macos")]
+        {
+            if let Some(paths) = super::macos_native::macos_pasteboard_read_file_urls() {
+                let valid: Vec<String> = paths
+                    .into_iter()
+                    .filter(|p| Path::new(p).exists())
+                    .collect();
+                if !valid.is_empty() {
+                    return valid;
+                }
+            }
+        }
         let script = concat!(
             "try\n",
             "set theFiles to the clipboard as «class furl»\n",
@@ -521,6 +543,7 @@ extern "C" {
     fn objc_getClass(name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
     fn sel_registerName(name: *const std::ffi::c_char) -> *mut std::ffi::c_void;
     fn objc_msgSend();
+    fn objc_release(obj: *mut std::ffi::c_void);
     fn objc_allocateClassPair(
         superclass: *mut std::ffi::c_void,
         name: *const std::ffi::c_char,
@@ -656,12 +679,26 @@ pub(super) fn start_native_os_file_drag(paths: &[String]) -> bool {
         let view_pt = msg_conv_pt(content_view, sel_conv, mouse_loc, std::ptr::null_mut());
 
         let arr_cls = objc_getClass(c"NSMutableArray".as_ptr());
-        let items_arr = msg0(arr_cls, sel_registerName(c"array".as_ptr()));
         let str_cls = objc_getClass(c"NSString".as_ptr());
         let url_cls = objc_getClass(c"NSURL".as_ptr());
         let item_cls = objc_getClass(c"NSDraggingItem".as_ptr());
         let ws_cls = objc_getClass(c"NSWorkspace".as_ptr());
-        let workspace = msg0(ws_cls, sel_registerName(c"sharedWorkspace".as_ptr()));
+        if arr_cls.is_null() || str_cls.is_null() || url_cls.is_null() || item_cls.is_null() {
+            // F-27: never message a null class; release the owned +new
+            // source instead of leaking it on this early exit.
+            objc_release(drag_source);
+            return false;
+        }
+        let workspace = if ws_cls.is_null() {
+            std::ptr::null_mut()
+        } else {
+            msg0(ws_cls, sel_registerName(c"sharedWorkspace".as_ptr()))
+        };
+        let items_arr = msg0(arr_cls, sel_registerName(c"array".as_ptr()));
+        if items_arr.is_null() {
+            objc_release(drag_source);
+            return false;
+        }
 
         let sel_utf8 = sel_registerName(c"stringWithUTF8String:".as_ptr());
         let sel_url = sel_registerName(c"fileURLWithPath:".as_ptr());
@@ -711,15 +748,23 @@ pub(super) fn start_native_os_file_drag(paths: &[String]) -> bool {
             };
             msg_set_frame(drag_item, sel_frame, frame, icon);
             msg1_void(items_arr, sel_add, drag_item);
+            // F-27: `alloc/-init` returned a +1 reference; the array took
+            // its own retain via `addObject:`, so drop ours to stop the
+            // per-file leak.
+            objc_release(drag_item);
             added_count += 1;
         }
 
         if added_count == 0 {
+            objc_release(drag_source);
             return false;
         }
 
         let sel_begin = sel_registerName(c"beginDraggingSessionWithItems:event:source:".as_ptr());
         let session = msg_begin_drag(content_view, sel_begin, items_arr, drag_ev, drag_source);
+        // F-27: the session retained the drag source for the duration of
+        // the drag; release our `+new` reference (one leak per drag).
+        objc_release(drag_source);
         !session.is_null()
     }
 }

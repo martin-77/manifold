@@ -64,6 +64,8 @@ mod archive;
 mod batch_rename;
 mod clipboard;
 mod drag_drop;
+#[cfg(target_os = "macos")]
+mod macos_native;
 mod shortcuts;
 mod sync_modal;
 mod transfer_worker;
