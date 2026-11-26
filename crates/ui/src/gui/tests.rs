@@ -801,6 +801,19 @@ fn test_v070_trash_freedesktop_trashinfo_and_no_permanent_delete_fallback() {
     let missing = format!("{src_dir}/does_not_exist.txt");
     assert!(move_path_to_trash(&vfs, &missing).is_err());
 
+    #[cfg(target_os = "macos")]
+    {
+        // R07: when the native Finder-aware trash fails, the app must
+        // report the refusal instead of degrading to the manual move
+        // into ~/.Trash (no Put-Back, Finder rejections bypassed).
+        let err = move_path_to_trash(&vfs, &missing).unwrap_err();
+        assert!(err.contains("macOS trash failed"), "got: {err}");
+        assert!(
+            err.contains("refused the less-safe manual move"),
+            "got: {err}"
+        );
+    }
+
     let _ = std::fs::remove_dir_all(&work_dir);
 }
 

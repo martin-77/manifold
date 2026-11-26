@@ -75,7 +75,7 @@ pub(super) fn move_path_to_trash_windows(path: &str) -> Result<String, String> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn encode_trashinfo_path(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len() + 16);
     for &b in raw.as_bytes() {
@@ -90,7 +90,7 @@ fn encode_trashinfo_path(raw: &str) -> String {
     out
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn ensure_dir_mode_0700(dir: &str) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     #[cfg(unix)]
@@ -109,24 +109,27 @@ pub(super) fn move_path_to_trash(vfs: &LocalFsBackend, path: &str) -> Result<Str
     }
     #[cfg(not(windows))]
     {
-        // F-7: on macOS prefer the native Finder-aware trash, which records
-        // the Put-Back metadata a manual rename to ~/.Trash cannot.
+        // F-7 / R07: on macOS the native Finder-aware trash is the only
+        // permitted route. The legacy manual move to ~/.Trash cannot
+        // record the Put-Back metadata, silently bypasses Finder's
+        // refusal reasons, and turns cross-volume trashes into a
+        // copy-then-delete of the whole tree. A failed native trash is
+        // therefore reported to the user instead of degrading to that
+        // less-safe path.
         #[cfg(target_os = "macos")]
         {
-            if let Ok(final_path) = super::macos_native::macos_trash_item(path) {
-                return Ok(final_path);
-            }
+            let _ = (vfs, path);
+            return super::macos_native::macos_trash_item(path).map_err(|e| {
+                format!("macOS trash failed ({e}); refused the less-safe manual move to ~/.Trash")
+            });
         }
-        let home = std::env::var("HOME")
-            .ok()
-            .filter(|h| !h.trim().is_empty())
-            .ok_or_else(|| "Cannot locate HOME directory for Trash".to_string())?;
-        let trimmed_home = home.trim_end_matches('/');
-        let (trash_files_dir, trash_info_dir) = if cfg!(target_os = "macos") {
-            let mac_trash = format!("{trimmed_home}/.Trash");
-            ensure_dir_mode_0700(&mac_trash)?;
-            (mac_trash, None)
-        } else {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let home = std::env::var("HOME")
+                .ok()
+                .filter(|h| !h.trim().is_empty())
+                .ok_or_else(|| "Cannot locate HOME directory for Trash".to_string())?;
+            let trimmed_home = home.trim_end_matches('/');
             let data_home = std::env::var("XDG_DATA_HOME")
                 .ok()
                 .filter(|s| !s.trim().is_empty())
@@ -137,70 +140,70 @@ pub(super) fn move_path_to_trash(vfs: &LocalFsBackend, path: &str) -> Result<Str
             let info_d = format!("{base}/info");
             ensure_dir_mode_0700(&files_d)?;
             ensure_dir_mode_0700(&info_d)?;
-            (files_d, Some(info_d))
-        };
-        let name = Path::new(path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("item");
+            let (trash_files_dir, trash_info_dir) = (files_d, Some(info_d));
+            let name = Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("item");
 
-        let mut trash_name = name.to_string();
-        let mut candidate = format!("{trash_files_dir}/{trash_name}");
-        let mut reserved_info_path: Option<String> = None;
-        let mut counter = 2u32;
+            let mut trash_name = name.to_string();
+            let mut candidate = format!("{trash_files_dir}/{trash_name}");
+            let mut reserved_info_path: Option<String> = None;
+            let mut counter = 2u32;
 
-        loop {
-            let cand_exists =
-                Path::new(&candidate).exists() || std::fs::symlink_metadata(&candidate).is_ok();
-            if !cand_exists {
-                if let Some(info_dir) = &trash_info_dir {
-                    let info_path = format!("{info_dir}/{trash_name}.trashinfo");
-                    let open_res = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&info_path);
-                    if let Ok(mut f) = open_res {
-                        let (yr, mo, dy, hr, mn) = manifold_vfs::current_local_civil_datetime();
-                        let del_ts = format!("{yr:04}-{mo:02}-{dy:02}T{hr:02}:{mn:02}:00");
-                        let enc_path = encode_trashinfo_path(path);
-                        let body =
-                            format!("[Trash Info]\nPath={enc_path}\nDeletionDate={del_ts}\n");
-                        let _ = f.write_all(body.as_bytes());
-                        reserved_info_path = Some(info_path);
+            loop {
+                let cand_exists =
+                    Path::new(&candidate).exists() || std::fs::symlink_metadata(&candidate).is_ok();
+                if !cand_exists {
+                    if let Some(info_dir) = &trash_info_dir {
+                        let info_path = format!("{info_dir}/{trash_name}.trashinfo");
+                        let open_res = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&info_path);
+                        if let Ok(mut f) = open_res {
+                            let (yr, mo, dy, hr, mn) = manifold_vfs::current_local_civil_datetime();
+                            let del_ts = format!("{yr:04}-{mo:02}-{dy:02}T{hr:02}:{mn:02}:00");
+                            let enc_path = encode_trashinfo_path(path);
+                            let body =
+                                format!("[Trash Info]\nPath={enc_path}\nDeletionDate={del_ts}\n");
+                            let _ = f.write_all(body.as_bytes());
+                            reserved_info_path = Some(info_path);
+                            break;
+                        }
+                    } else {
                         break;
                     }
-                } else {
-                    break;
                 }
+                trash_name = format!("{name} {counter}");
+                candidate = format!("{trash_files_dir}/{trash_name}");
+                counter += 1;
             }
-            trash_name = format!("{name} {counter}");
-            candidate = format!("{trash_files_dir}/{trash_name}");
-            counter += 1;
-        }
 
-        if std::fs::rename(path, &candidate).is_ok() {
-            return Ok(candidate);
-        }
+            if std::fs::rename(path, &candidate).is_ok() {
+                return Ok(candidate);
+            }
 
-        let copy_res = if Path::new(path).is_dir() {
-            copy_local_dir_preserving_bundle(path, &candidate)
-        } else {
-            vfs.copy_file(path, &candidate).map_err(|e| e.to_string())
-        };
-        if let Err(err) = copy_res {
-            if let Some(info_p) = &reserved_info_path {
-                let _ = std::fs::remove_file(info_p);
+            let copy_res = if Path::new(path).is_dir() {
+                copy_local_dir_preserving_bundle(path, &candidate)
+            } else {
+                vfs.copy_file(path, &candidate).map_err(|e| e.to_string())
+            };
+            if let Err(err) = copy_res {
+                if let Some(info_p) = &reserved_info_path {
+                    let _ = std::fs::remove_file(info_p);
+                }
+                return Err(err);
             }
-            return Err(err);
-        }
-        if let Err(err) = vfs.remove(path, true) {
-            let _ = vfs.remove(&candidate, true);
-            if let Some(info_p) = &reserved_info_path {
-                let _ = std::fs::remove_file(info_p);
+            if let Err(err) = vfs.remove(path, true) {
+                let _ = vfs.remove(&candidate, true);
+                if let Some(info_p) = &reserved_info_path {
+                    let _ = std::fs::remove_file(info_p);
+                }
+                return Err(err.to_string());
             }
-            return Err(err.to_string());
+            Ok(candidate)
         }
-        Ok(candidate)
     }
 }
 

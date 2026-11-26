@@ -111,7 +111,8 @@ unsafe fn ns_array_from_pointers(items: &[*mut c_void]) -> Option<*mut c_void> {
 /// Moves `path` to the macOS Trash via `NSFileManager trashItemAtURL:`,
 /// which records the Finder Put-Back metadata the manual rename to
 /// `~/.Trash` never could (F-7). Returns the final Trash path on success;
-/// `Err` signals that the caller should use the legacy manual move.
+/// `Err` is surfaced to the user — the caller must NOT degrade to the
+/// less-safe manual move (R07).
 pub(super) fn macos_trash_item(path: &str) -> Result<String, String> {
     unsafe {
         let fm_cls = objc_getClass(c"NSFileManager".as_ptr());
