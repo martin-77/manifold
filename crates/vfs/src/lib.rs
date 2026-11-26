@@ -478,6 +478,27 @@ pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
+// R10: Test-only synchronization point fired between the sandbox
+// containment checks and the actual directory-entry operation in
+// `rename`/`remove`/`create_dir`. Tests set the hook to deterministically
+// simulate an attacker swapping a path component in that window; the
+// hardened implementation must still stay inside the sandbox. No-op
+// outside `cfg(test)`.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_RACE_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn run_test_race_hook() {
+    TEST_RACE_HOOK.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f();
+        }
+    });
+}
+
 /// Atomically exchanges two existing paths of the same type on the same
 /// volume. macOS uses `renamex_np(RENAME_SWAP)`, Linux uses
 /// `renameat2(RENAME_EXCHANGE)`; both are single-syscall exchanges with no
@@ -1278,10 +1299,10 @@ impl LocalFsBackend {
     }
 
     /// F-18: re-check the parent directory's real path immediately before a
-    /// directory-entry operation (create/remove/rename). std exposes no
-    /// `openat`/`renameat`, so this narrows the race window rather than
-    /// closing it; the read path is fully closed via
-    /// [`LocalFsBackend::verify_fd_in_sandbox`].
+    /// directory-entry operation (create/remove/rename). For the sandboxed
+    /// unix case this is superseded by [`LocalFsBackend::pinned_parent`]
+    /// (R10), which pins the parent via an open descriptor instead of only
+    /// narrowing the race window.
     fn revalidate_parent_in_sandbox(&self, resolved: &Path) -> Result<(), VfsError> {
         let Some(root) = &self.sandbox_root else {
             return Ok(());
@@ -1297,6 +1318,121 @@ impl LocalFsBackend {
                     resolved.display()
                 )));
             }
+        }
+        Ok(())
+    }
+
+    /// R10: For a sandboxed backend, opens the parent directory of
+    /// `resolved` and verifies containment through the open descriptor
+    /// (`F_GETPATH`), returning the pinned handle plus the final path
+    /// component. Directory-entry operations run relative to this fd via
+    /// `renameat`/`unlinkat`/`mkdirat`, none of which follow the final
+    /// component: a later swap of the parent cannot redirect them, because
+    /// the descriptor pins exactly the directory that was verified.
+    /// Returns `Ok(None)` when no sandbox is configured.
+    #[cfg(unix)]
+    fn pinned_parent<'a>(
+        &self,
+        resolved: &'a Path,
+    ) -> Result<Option<(std::fs::File, &'a std::ffi::OsStr)>, VfsError> {
+        if self.sandbox_root.is_none() {
+            return Ok(None);
+        }
+        let parent = resolved.parent().ok_or_else(|| {
+            VfsError::InvalidPath(format!("No parent for {}", resolved.display()))
+        })?;
+        let name = resolved.file_name().ok_or_else(|| {
+            VfsError::InvalidPath(format!("No file name for {}", resolved.display()))
+        })?;
+        let dir = fs::File::open(parent).map_err(|e| {
+            VfsError::InvalidPath(format!(
+                "Cannot open parent of {} for sandbox verification: {e}",
+                resolved.display()
+            ))
+        })?;
+        if !dir.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+            return Err(VfsError::InvalidPath(format!(
+                "Parent of {} is not a directory",
+                resolved.display()
+            )));
+        }
+        // The descriptor is the truth: a component swap that happened
+        // before this point is visible here and rejected.
+        self.verify_fd_in_sandbox(&dir, &parent.to_string_lossy())?;
+        Ok(Some((dir, name)))
+    }
+
+    /// R10: `create_dir_all` semantics inside the sandbox. Walks down from
+    /// the deepest existing ancestor pinned through an open descriptor and
+    /// creates every missing component with `mkdirat`, which never follows
+    /// a final-component symlink: a planted symlink errors instead of
+    /// steering the creation outside the sandbox.
+    #[cfg(unix)]
+    fn create_dir_sandboxed(&self, resolved: &Path) -> Result<(), VfsError> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::{AsRawFd, FromRawFd};
+
+        let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
+        let mut probe = resolved;
+        loop {
+            match fs::symlink_metadata(probe) {
+                Ok(m) if m.file_type().is_dir() => break,
+                Ok(m) if m.file_type().is_symlink() => {
+                    return Err(VfsError::InvalidPath(format!(
+                        "Path component of {} is a symlink; refusing to create through it",
+                        resolved.display()
+                    )));
+                }
+                Ok(_) => {
+                    return Err(VfsError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!("{} exists and is not a directory", resolved.display()),
+                    )));
+                }
+                Err(_) => {
+                    let name = probe.file_name().ok_or_else(|| {
+                        VfsError::InvalidPath("Cannot create the sandbox root".to_string())
+                    })?;
+                    missing.push(name);
+                    probe = probe.parent().ok_or_else(|| {
+                        VfsError::InvalidPath("No parent for directory creation".to_string())
+                    })?;
+                }
+            }
+        }
+        let mut dir = fs::File::open(probe).map_err(|e| {
+            VfsError::InvalidPath(format!(
+                "Cannot open ancestor {} for sandbox verification: {e}",
+                probe.display()
+            ))
+        })?;
+        self.verify_fd_in_sandbox(&dir, &probe.to_string_lossy())?;
+        for name in missing.iter().rev() {
+            let c = CString::new(name.as_bytes())
+                .map_err(|_| VfsError::InvalidPath("Nul in path component".to_string()))?;
+            let rc = unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o755) };
+            if rc != 0 {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(VfsError::IoError(e));
+                }
+            }
+            // Pin the created child for the next level. O_NOFOLLOW turns a
+            // raced symlink into an error instead of a walk escape.
+            let child_rc = unsafe {
+                libc::openat(
+                    dir.as_raw_fd(),
+                    c.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                )
+            };
+            if child_rc < 0 {
+                return Err(VfsError::IoError(std::io::Error::last_os_error()));
+            }
+            let child = unsafe { std::fs::File::from_raw_fd(child_rc) };
+            self.verify_fd_in_sandbox(&child, &name.to_string_lossy())?;
+            dir = child;
         }
         Ok(())
     }
@@ -1643,6 +1779,12 @@ impl FileSystemBackend for LocalFsBackend {
 
     fn create_dir(&self, path: &str) -> Result<(), VfsError> {
         let resolved = self.resolve_safe_path(path)?;
+        #[cfg(test)]
+        crate::run_test_race_hook();
+        #[cfg(unix)]
+        if self.sandbox_root.is_some() {
+            return self.create_dir_sandboxed(&resolved);
+        }
         fs::create_dir_all(&resolved)?;
         Ok(())
     }
@@ -1654,6 +1796,63 @@ impl FileSystemBackend for LocalFsBackend {
             if attrs.is_locked {
                 let msg = format!("Item is locked: {}", resolved.display());
                 return Err(VfsError::PermissionDenied(msg));
+            }
+        }
+        #[cfg(test)]
+        crate::run_test_race_hook();
+        #[cfg(unix)]
+        {
+            // R10: perform the removal relative to a pinned,
+            // descriptor-verified parent. `unlinkat` does not follow the
+            // final component, so the sandbox entry itself is removed and
+            // a swapped parent cannot silently redirect the operation.
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::io::AsRawFd;
+            if let Some((dir, name)) = self.pinned_parent(&resolved)? {
+                let c_name = CString::new(name.as_bytes())
+                    .map_err(|_| VfsError::InvalidPath("Nul in path component".to_string()))?;
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let rc = unsafe {
+                    libc::fstatat(
+                        dir.as_raw_fd(),
+                        c_name.as_ptr(),
+                        &mut st,
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if rc != 0 {
+                    let e = std::io::Error::last_os_error();
+                    return Err(if e.raw_os_error() == Some(libc::ENOENT) {
+                        VfsError::NotFound(path.to_string())
+                    } else {
+                        VfsError::IoError(e)
+                    });
+                }
+                let ty = (st.st_mode as u32) & (libc::S_IFMT as u32);
+                if ty == (libc::S_IFDIR as u32) && recursive {
+                    // Recursive walks need path semantics; verify the
+                    // target directory through its own open descriptor
+                    // first so a final-component swap is rejected before
+                    // anything is deleted. (The walk itself keeps a small
+                    // documented window; std has no fd-based
+                    // remove_all.)
+                    let child = fs::File::open(&resolved).map_err(VfsError::IoError)?;
+                    self.verify_fd_in_sandbox(&child, path)?;
+                    fs::remove_dir_all(&resolved)?;
+                } else if ty == (libc::S_IFDIR as u32) {
+                    let rc = unsafe {
+                        libc::unlinkat(dir.as_raw_fd(), c_name.as_ptr(), libc::AT_REMOVEDIR)
+                    };
+                    if rc != 0 {
+                        return Err(VfsError::IoError(std::io::Error::last_os_error()));
+                    }
+                } else {
+                    let rc = unsafe { libc::unlinkat(dir.as_raw_fd(), c_name.as_ptr(), 0) };
+                    if rc != 0 {
+                        return Err(VfsError::IoError(std::io::Error::last_os_error()));
+                    }
+                }
+                return Ok(());
             }
         }
         let meta = fs::symlink_metadata(&resolved).map_err(|e| match e.kind() {
@@ -1680,6 +1879,43 @@ impl FileSystemBackend for LocalFsBackend {
             if attrs.is_locked {
                 let msg = format!("Item is locked: {}", src.display());
                 return Err(VfsError::PermissionDenied(msg));
+            }
+        }
+        #[cfg(test)]
+        crate::run_test_race_hook();
+        #[cfg(unix)]
+        {
+            // R10: run the rename relative to pinned, descriptor-verified
+            // parents. `renameat` does not follow the final component and
+            // the open fds pin the directories, so a swap of any path
+            // component after the checks cannot redirect this rename.
+            if let (Some((src_dir, src_name)), Some((dst_dir, dst_name))) =
+                (self.pinned_parent(&src)?, self.pinned_parent(&dst)?)
+            {
+                use std::os::unix::ffi::OsStrExt;
+                use std::os::unix::io::AsRawFd;
+                let c_src = CString::new(src_name.as_bytes())
+                    .map_err(|_| VfsError::InvalidPath("Nul in path component".to_string()))?;
+                let c_dst = CString::new(dst_name.as_bytes())
+                    .map_err(|_| VfsError::InvalidPath("Nul in path component".to_string()))?;
+                let rc = unsafe {
+                    libc::renameat(
+                        src_dir.as_raw_fd(),
+                        c_src.as_ptr(),
+                        dst_dir.as_raw_fd(),
+                        c_dst.as_ptr(),
+                    )
+                };
+                if rc != 0 {
+                    return Err(VfsError::IoError(std::io::Error::last_os_error()));
+                }
+                if let Ok(mut map) = self.attrs_overlay.write() {
+                    let prev = map.remove(&src);
+                    if let Some(attrs) = prev {
+                        map.insert(dst, attrs);
+                    }
+                }
+                return Ok(());
             }
         }
         fs::rename(&src, &dst)?;
@@ -3127,5 +3363,127 @@ mod archive_json_tests {
         };
         assert!(n > 0, "xattr must survive the atomic overwrite");
         assert_eq!(&buf[..n as usize], value);
+    }
+
+    // ---- R10: sandbox TOCTOU on directory-entry operations ----
+
+    /// Sets the test race hook to swap `root/dir` for a symlink pointing
+    /// at `outside` immediately after the containment checks.
+    #[cfg(unix)]
+    fn plant_parent_swap_hook(root: &std::path::Path, outside: &std::path::Path) {
+        let (root_c, outside_c) = (root.to_path_buf(), outside.to_path_buf());
+        TEST_RACE_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                let _ = std::fs::rename(root_c.join("dir"), root_c.join("dir.real"));
+                let _ = std::os::unix::fs::symlink(&outside_c, root_c.join("dir"));
+            }));
+        });
+    }
+
+    #[cfg(unix)]
+    fn clear_race_hook() {
+        TEST_RACE_HOOK.with(|h| *h.borrow_mut() = None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_rejects_parent_swapped_after_containment_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("dir/file.txt"), b"data").unwrap();
+        std::fs::write(outside.join("file.txt"), b"outside-data").unwrap();
+        let vfs = LocalFsBackend::with_sandbox_root(&root).unwrap();
+
+        plant_parent_swap_hook(&root, &outside);
+        let res = vfs.rename("/dir/file.txt", "/moved.txt");
+        clear_race_hook();
+
+        assert!(
+            res.is_err(),
+            "a rename whose parent was swapped outside must be rejected, got {res:?}"
+        );
+        assert!(
+            outside.join("file.txt").exists(),
+            "the swapped rename must not have moved the outside file"
+        );
+        assert!(!root.join("moved.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_rejects_parent_swapped_after_containment_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("dir/file.txt"), b"data").unwrap();
+        std::fs::write(outside.join("file.txt"), b"outside-data").unwrap();
+        let vfs = LocalFsBackend::with_sandbox_root(&root).unwrap();
+
+        plant_parent_swap_hook(&root, &outside);
+        let res = vfs.remove("/dir/file.txt", false);
+        clear_race_hook();
+
+        assert!(
+            res.is_err(),
+            "a removal whose parent was swapped outside must be rejected, got {res:?}"
+        );
+        assert!(
+            outside.join("file.txt").exists(),
+            "the swapped removal must not have deleted the outside file"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_dir_rejects_parent_swapped_after_containment_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let vfs = LocalFsBackend::with_sandbox_root(&root).unwrap();
+
+        plant_parent_swap_hook(&root, &outside);
+        let res = vfs.create_dir("/dir/newsub");
+        clear_race_hook();
+
+        assert!(
+            res.is_err(),
+            "a directory creation whose parent was swapped outside must be rejected, got {res:?}"
+        );
+        assert!(
+            !outside.join("newsub").exists(),
+            "nothing may be created outside through the swapped parent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandboxed_entry_operations_still_work_normally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let vfs = LocalFsBackend::with_sandbox_root(&root).unwrap();
+
+        vfs.write_bytes("a.txt", b"content").unwrap();
+        vfs.rename("/a.txt", "/b.txt").unwrap();
+        assert_eq!(vfs.read_bytes("/b.txt").unwrap(), b"content");
+        vfs.create_dir("/x/y/z").unwrap();
+        assert!(root.join("x/y/z").is_dir());
+        vfs.write_bytes("/x/y/z/deep.txt", b"d").unwrap();
+        vfs.remove("/x/y/z/deep.txt", false).unwrap();
+        assert!(!root.join("x/y/z/deep.txt").exists());
+        vfs.remove("/x", true).unwrap();
+        assert!(!root.join("x").exists());
+        // Removing a missing entry reports NotFound, not a panic.
+        assert!(matches!(
+            vfs.remove("/gone.txt", false),
+            Err(VfsError::NotFound(_))
+        ));
     }
 }
