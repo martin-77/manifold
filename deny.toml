@@ -1,0 +1,50 @@
+# cargo-deny configuration
+# https://github.com/EmbarkStudios/cargo-deny
+#
+# NOTE: The workspace currently declares `license = "MIT OR Apache-2.0"` in
+# Cargo.toml while README.md mentions only MIT and no LICENSE file exists in
+# the repository. This inconsistency is intentionally NOT resolved here and
+# is documented for upstream review (see docs/fork-review/AUDIT_PROGRESS.md).
+
+[graph]
+all-features = false
+
+[advisories]
+# Use the advisory DB defaults; no blanket ignores.
+yanked-warnings = "warn"
+
+[licenses]
+# Only fail on unknown/unsupported license expressions.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-1-Clause",
+    "BSD-2-Clause",
+    "BSD-2-Clause-Patent",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "0BSD",
+    "CC0-1.0",
+    "OpenSSL",
+    "Unlicense",
+    "MPL-2.0",
+    "LGPL-2.1",
+    "LGPL-3.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
