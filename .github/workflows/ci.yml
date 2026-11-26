@@ -15,13 +15,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14 # Apple Silicon (arm64)
+          # macos-14 was retired on 2026-11-02 (jobs requesting it were
+          # cancelled instantly); macos-15 is the current arm64 label
+          # (R14, per actions/runner-images docs).
+          - os: macos-15 # Apple Silicon (arm64)
           - os: ubuntu-24.04
           - os: windows-2022
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
+      # Installs the toolchain pinned in rust-toolchain.toml (concrete
+      # version, R14) with rustfmt/clippy.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -56,6 +61,21 @@ jobs:
           # pasteboard/Trash). CI runners are ephemeral, so this is safe
           # there and skipped on developer machines.
           MANIFOLD_TEST_ALLOW_SESSION_STATE: 1
+
+  msrv:
+    name: MSRV check (cargo check on 1.92)
+    # The dependency-driven MSRV (Slint 1.18 requires rustc >= 1.92);
+    # verified here so the `rust-version` metadata in Cargo.toml stays
+    # honest (R14).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.92.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Check against MSRV
+        run: cargo check --workspace --all-targets --locked
 
   deny:
     name: cargo-deny (advisories / bans / licenses)

@@ -168,8 +168,10 @@ Expand-Archive -Path manifold-windows-x86_64.zip -DestinationPath .
 ## Build from Source
 
 ### Prerequisites
-- **Rust**: Stable toolchain (`1.87+`, 2021 edition; `is_multiple_of` has
-  been stable since 1.87 — the workspace is verified against pinned stable)
+- **Rust**: pinned stable toolchain `1.98.1` (auto-installed by rustup via
+  `rust-toolchain.toml`; 2021 edition). The dependency-driven MSRV is
+  `1.92` (Slint 1.18 requires rustc >= 1.92) and is verified in CI with a
+  dedicated `cargo check` job.
 - **Linux dependencies**:
   ```bash
   sudo apt-get install -y build-essential pkg-config cmake ninja-build clang \

@@ -616,14 +616,16 @@ impl CredentialStore {
                     ));
                 }
             }
-            #[cfg(not(windows))]
-            if cfg!(target_os = "macos") {
+            #[cfg(all(not(windows), target_os = "macos"))]
+            {
                 let svc = escape_macos_security_token(KEYRING_SERVICE_NAME);
                 let acct = escape_macos_security_token(connection_id);
                 let pw = escape_macos_security_token(secret);
                 let script = format!("add-generic-password -U -s {svc} -a {acct} -w {pw}\n");
                 Self::run_macos_security_script(&script)?;
-            } else {
+            }
+            #[cfg(all(not(windows), not(target_os = "macos")))]
+            {
                 let child = Command::new("secret-tool")
                     .args([
                         "store",

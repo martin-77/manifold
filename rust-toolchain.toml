@@ -1,6 +1,8 @@
-# Pin the project to the stable toolchain.
-# The workspace builds cleanly on stable (verified on 1.98.1); no nightly
-# features are used (`is_multiple_of` has been stable since 1.87).
+# Pin the project to a concrete stable toolchain (R14) so local and CI
+# builds are reproducible; bump this version deliberately. Verified on
+# 1.98.1 (2026-11-26). No nightly features are used (`is_multiple_of`
+# has been stable since 1.87). The dependency-driven MSRV (1.92) lives in
+# the workspace `rust-version` and is checked in CI.
 [toolchain]
-channel = "stable"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]

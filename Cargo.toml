@@ -13,6 +13,10 @@ members = [
 [workspace.package]
 version = "0.8.0"
 edition = "2021"
+# MSRV (R14): driven by dependencies (Slint 1.18 requires rustc >= 1.92);
+# verified in CI with `cargo check` on 1.92.0. The day-to-day toolchain is
+# pinned concretely in rust-toolchain.toml.
+rust-version = "1.92"
 license = "MIT OR Apache-2.0"
 authors = ["Manifold Contributors"]
 description = "Manifold — Cross-Platform Dual-Pane File Manager & Transfer Engine"

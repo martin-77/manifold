@@ -3315,7 +3315,7 @@ mod archive_json_tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
     fn atomic_write_preserves_platform_metadata_on_overwrite() {
         use std::os::unix::fs::PermissionsExt;

@@ -1801,6 +1801,9 @@ mod hardening_tests {
     }
 
     /// Serializes tests that shadow the real `curl` via `PATH`.
+    /// The fake-curl harness is a POSIX shell script, so the whole suite
+    /// around it is unix-only (R14: it broke the Windows build).
+    #[cfg(unix)]
     fn curl_path_lock() -> std::sync::MutexGuard<'static, ()> {
         static PATH_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
         PATH_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
@@ -1808,6 +1811,7 @@ mod hardening_tests {
 
     /// Installs a fake `curl` binary whose behavior is defined by `body`
     /// (a POSIX snippet receiving the curl config on stdin).
+    #[cfg(unix)]
     fn install_fake_curl(body: &str) -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -1832,6 +1836,7 @@ mod hardening_tests {
         profile
     }
 
+    #[cfg(unix)] // fake-curl harness is POSIX-only (R14)
     #[test]
     fn s3_list_directory_follows_continuation_tokens() {
         let _guard = curl_path_lock();
@@ -1852,6 +1857,7 @@ esac"#,
         drop(dir);
     }
 
+    #[cfg(unix)] // fake-curl harness is POSIX-only (R14)
     #[test]
     fn s3_remove_tree_deletes_every_child_key_and_marker() {
         let _guard = curl_path_lock();
@@ -1895,6 +1901,7 @@ esac"#,
         );
     }
 
+    #[cfg(unix)] // fake-curl harness is POSIX-only (R14)
     #[test]
     fn gcs_defaults_to_interoperability_endpoint() {
         let _guard = curl_path_lock();
@@ -1921,6 +1928,7 @@ printf '<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>'"#
         drop(dir);
     }
 
+    #[cfg(unix)] // fake-curl harness is POSIX-only (R14)
     #[test]
     fn webdav_quota_propfind_reports_real_capacity() {
         let _guard = curl_path_lock();
@@ -1947,6 +1955,7 @@ printf '<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>'"#
         drop(dir);
     }
 
+    #[cfg(unix)] // fake-curl harness is POSIX-only (R14)
     #[test]
     fn webdav_download_replaces_target_only_on_success() {
         let _guard = curl_path_lock();
