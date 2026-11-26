@@ -168,7 +168,8 @@ Expand-Archive -Path manifold-windows-x86_64.zip -DestinationPath .
 ## Build from Source
 
 ### Prerequisites
-- **Rust**: Stable toolchain (`1.80+`, 2021 edition)
+- **Rust**: Stable toolchain (`1.87+`, 2021 edition; `is_multiple_of` has
+  been stable since 1.87 — the workspace is verified against pinned stable)
 - **Linux dependencies**:
   ```bash
   sudo apt-get install -y build-essential pkg-config cmake ninja-build clang \

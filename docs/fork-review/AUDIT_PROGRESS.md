@@ -35,15 +35,15 @@
 | F-14 | Engine ignores pause/cancel handle | static-path | library-only | fixed | `3864de3` |
 | F-15 | Fake remote volume stats (500 GB/470 GB) | static-path | productive | fixed | `5767099` |
 | F-16 | Preview placeholders (1920×1080, 120 s, page 1) | static-path | productive | fixed | `5767099` |
-| F-17 | RwLock poisoning panics (no blanket `into_inner` allowed) | static-potential | productive | open | — |
-| F-18 | Sandbox TOCTOU | static-potential | productive | open | — |
+| F-17 | RwLock poisoning panics (no blanket `into_inner` allowed) | static-potential | productive | fixed | `570d77e` |
+| F-18 | Sandbox TOCTOU | static-potential | productive | fixed | `0d5a3c8` |
 | F-19 | Edit-in-place last-writer-wins | static-path | productive | fixed | `88cd6e6` |
 | F-20 | Hand-rolled HMAC-SHA256 / `xml_unescape` order bug | static-path | productive | fixed | `5c7ff9e` |
 | F-21 | Sync engine: whole-file RAM, silent `let _ = remove()`, no rollback | static-path | productive (Cmd+Shift+Y) | fixed | `737a373` |
 | F-22 | 45 ms idle timer + polling (energy) | static-path | productive | fixed | `cc38eff` |
 | F-23 | Drag-out downloads synchronously on UI thread; staging never purged | static-path | productive | fixed | `cc38eff` |
-| F-24 | README claims stable 1.80+, but `is_multiple_of` needs 1.87 | static | n/a (docs) | open | — |
-| F-25 | No `deny.toml`, no CI, no LICENSE file, license metadata inconsistent | static | n/a (infra) | open | — |
+| F-24 | README claims stable 1.80+, but `is_multiple_of` needs 1.87 | static | n/a (docs) | fixed | `b884a4a` |
+| F-25 | No `deny.toml`, no CI, no LICENSE file, license metadata inconsistent | static | n/a (infra) | fixed (deny.toml `3480a9b`, CI `a8194f2`, license documented) | `b884a4a` |
 | F-26 | macOS file clipboard via osascript (no native flavors, single-file paste) | static-path | productive | fixed | `58402c0` |
 | F-27 | Hand-rolled ObjC drag: leaks, fragile transmutes | static-path | productive | fixed | `58402c0` |
 | F-28 | `smbclient` not present on macOS by default | static-path | productive | fixed | `58402c0` |
