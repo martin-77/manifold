@@ -5,6 +5,9 @@ pub(super) enum BgSyncEvent {
     ExecFinished {
         dest_dir: String,
         result: Result<(usize, usize), String>,
+        /// Non-fatal notes from execution, e.g. retired backups that could
+        /// not be deleted after a successful replacement (R01).
+        warnings: Vec<String>,
     },
 }
 
@@ -188,16 +191,21 @@ impl GuiRuntime {
                 }
                 None => Some(&local_vfs as &dyn FileSystemBackend),
             };
-            let result = match (src_vfs, dst_vfs) {
-                (Some(sv), Some(dv)) => plan
-                    .execute(sv, dv)
-                    .map(|applied| (total, applied))
-                    .map_err(|e| e.to_string()),
-                _ => Err("Remote VFS is not connected".to_string()),
+            let (result, warnings) = match (src_vfs, dst_vfs) {
+                (Some(sv), Some(dv)) => {
+                    let outcome = plan.execute(sv, dv);
+                    let res = match outcome.error {
+                        Some(e) => Err(e.to_string()),
+                        None => Ok((total, outcome.applied)),
+                    };
+                    (res, outcome.warnings)
+                }
+                _ => (Err("Remote VFS is not connected".to_string()), Vec::new()),
             };
             let _ = tx.send(BgSyncEvent::ExecFinished {
                 dest_dir: dst,
                 result,
+                warnings,
             });
         });
     }
@@ -212,11 +220,17 @@ impl GuiRuntime {
         let dst = self.current_pane_path(true);
         let src_vfs = self.backend_for_path(&src);
         let dst_vfs = self.backend_for_path(&dst);
-        let applied = plan.execute(src_vfs, dst_vfs).map_err(|e| e.to_string())?;
+        let outcome = plan.execute(src_vfs, dst_vfs);
+        for w in &outcome.warnings {
+            self.logs.push(format!("[SYNC_WARN] {w}"));
+        }
+        if let Some(e) = outcome.error {
+            return Err(e.to_string());
+        }
         self.invalidate_dir_cache();
         self.reload_pane_entries(false);
         self.reload_pane_entries(true);
-        Ok((total, applied))
+        Ok((total, outcome.applied))
     }
 }
 

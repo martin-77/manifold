@@ -102,14 +102,23 @@ impl SyncExecutionPlan {
         if depth > 32 {
             return Ok(());
         }
+        // A directory on one side may be a plain file on the other (the
+        // replacement case); listing such a path yields NotADirectory on
+        // real filesystems and NotFound on virtual ones. Both mean
+        // "no children to compare" below the root.
+        let not_a_dir = |e: &VfsError| match e {
+            VfsError::NotFound(_) => true,
+            VfsError::IoError(io) => io.kind() == std::io::ErrorKind::NotADirectory,
+            _ => false,
+        };
         let left_items = match ctx.left_vfs.list_directory(left_dir) {
             Ok(list) => list,
-            Err(VfsError::NotFound(_)) if depth > 0 => Vec::new(),
+            Err(e) if depth > 0 && not_a_dir(&e) => Vec::new(),
             Err(e) => return Err(e),
         };
         let right_items = match ctx.right_vfs.list_directory(right_dir) {
             Ok(list) => list,
-            Err(VfsError::NotFound(_)) if depth > 0 => Vec::new(),
+            Err(e) if depth > 0 && not_a_dir(&e) => Vec::new(),
             Err(e) => return Err(e),
         };
 
@@ -251,15 +260,27 @@ impl SyncExecutionPlan {
         }
     }
 
-    /// Executes all approved changeset entries across `left_vfs` and `right_vfs`,
-    /// handling nested subdirectories, file-vs-directory replacements, and bottom-up deletes (`GAP-03`).
+    /// Executes all approved changeset entries across `left_vfs` and
+    /// `right_vfs`, handling nested subdirectories, file-vs-directory
+    /// replacements, and bottom-up deletes (`GAP-03`).
+    ///
+    /// Stops at the first failure and reports how many entries were applied
+    /// before it (R01); a failed replacement never destroys the previous
+    /// destination (see [`publish_staged_file`] / [`replace_with_directory`]).
     pub fn execute(
         &self,
         left_vfs: &dyn FileSystemBackend,
         right_vfs: &dyn FileSystemBackend,
-    ) -> Result<usize, VfsError> {
-        let mut applied = 0usize;
+    ) -> SyncExecutionOutcome {
+        let mut outcome = SyncExecutionOutcome::default();
         let mut pending_deletes: Vec<&SyncChangesetEntry> = Vec::new();
+
+        macro_rules! bail {
+            ($e:expr) => {{
+                outcome.error = Some($e);
+                return outcome;
+            }};
+        }
 
         for entry in &self.entries {
             if !entry.approved {
@@ -282,32 +303,38 @@ impl SyncExecutionPlan {
                         .as_ref()
                         .map(|m| m.is_dir)
                         .unwrap_or_else(|| left_vfs.metadata(&l_path).is_ok_and(|m| m.is_dir));
+                    let dst_plan = DstAtPlan::from_meta(entry.right_meta.as_ref());
                     if is_dir {
-                        if entry.right_meta.as_ref().is_some_and(|m| !m.is_dir) {
-                            right_vfs
-                                .remove(&r_path, false)
-                                .map_err(|e| err_for(&entry.relative_path, e))?;
+                        match replace_with_directory(
+                            right_vfs,
+                            &r_path,
+                            &entry.relative_path,
+                            dst_plan,
+                        ) {
+                            Ok(w) => outcome.warnings.extend(w),
+                            Err(e) => bail!(e),
                         }
-                        right_vfs
-                            .create_dir(&r_path)
-                            .map_err(|e| err_for(&entry.relative_path, e))?;
                     } else {
                         if let Some((parent, _)) =
                             r_path.rsplit_once('/').filter(|(p, _)| !p.is_empty())
                         {
-                            right_vfs
-                                .create_dir(parent)
-                                .map_err(|e| err_for(&entry.relative_path, e))?;
+                            if let Err(e) = right_vfs.create_dir(parent) {
+                                bail!(err_for(&entry.relative_path, e));
+                            }
                         }
-                        copy_file_safely(
+                        match copy_file_safely(
                             left_vfs,
                             right_vfs,
                             &l_path,
                             &r_path,
                             &entry.relative_path,
-                        )?;
+                            dst_plan,
+                        ) {
+                            Ok(w) => outcome.warnings.extend(w),
+                            Err(e) => bail!(e),
+                        }
                     }
-                    applied += 1;
+                    outcome.applied += 1;
                 }
                 SyncOperation::CopyRightToLeft => {
                     let is_dir = entry
@@ -315,32 +342,38 @@ impl SyncExecutionPlan {
                         .as_ref()
                         .map(|m| m.is_dir)
                         .unwrap_or_else(|| right_vfs.metadata(&r_path).is_ok_and(|m| m.is_dir));
+                    let dst_plan = DstAtPlan::from_meta(entry.left_meta.as_ref());
                     if is_dir {
-                        if entry.left_meta.as_ref().is_some_and(|m| !m.is_dir) {
-                            left_vfs
-                                .remove(&l_path, false)
-                                .map_err(|e| err_for(&entry.relative_path, e))?;
+                        match replace_with_directory(
+                            left_vfs,
+                            &l_path,
+                            &entry.relative_path,
+                            dst_plan,
+                        ) {
+                            Ok(w) => outcome.warnings.extend(w),
+                            Err(e) => bail!(e),
                         }
-                        left_vfs
-                            .create_dir(&l_path)
-                            .map_err(|e| err_for(&entry.relative_path, e))?;
                     } else {
                         if let Some((parent, _)) =
                             l_path.rsplit_once('/').filter(|(p, _)| !p.is_empty())
                         {
-                            left_vfs
-                                .create_dir(parent)
-                                .map_err(|e| err_for(&entry.relative_path, e))?;
+                            if let Err(e) = left_vfs.create_dir(parent) {
+                                bail!(err_for(&entry.relative_path, e));
+                            }
                         }
-                        copy_file_safely(
+                        match copy_file_safely(
                             right_vfs,
                             left_vfs,
                             &r_path,
                             &l_path,
                             &entry.relative_path,
-                        )?;
+                            dst_plan,
+                        ) {
+                            Ok(w) => outcome.warnings.extend(w),
+                            Err(e) => bail!(e),
+                        }
                     }
-                    applied += 1;
+                    outcome.applied += 1;
                 }
                 SyncOperation::DeleteLeft
                 | SyncOperation::DeleteRight
@@ -358,21 +391,21 @@ impl SyncExecutionPlan {
                 SyncOperation::DeleteLeft => {
                     match left_vfs.remove(&l_path, true) {
                         Ok(()) | Err(VfsError::NotFound(_)) => {}
-                        Err(e) => return Err(err_for(&entry.relative_path, e)),
+                        Err(e) => bail!(err_for(&entry.relative_path, e)),
                     }
-                    applied += 1;
+                    outcome.applied += 1;
                 }
                 SyncOperation::DeleteRight => {
                     match right_vfs.remove(&r_path, true) {
                         Ok(()) | Err(VfsError::NotFound(_)) => {}
-                        Err(e) => return Err(err_for(&entry.relative_path, e)),
+                        Err(e) => bail!(err_for(&entry.relative_path, e)),
                     }
-                    applied += 1;
+                    outcome.applied += 1;
                 }
                 _ => {}
             }
         }
-        Ok(applied)
+        outcome
     }
 }
 
@@ -382,20 +415,242 @@ fn err_for(relative: &str, e: VfsError) -> VfsError {
     VfsError::OperationFailed(relative.to_string(), e.to_string())
 }
 
+/// Result of applying a [`SyncExecutionPlan`]: how many entries were
+/// applied before completion or the first failure, non-fatal warnings
+/// (e.g. retired backups that could not be deleted), and the first error
+/// if execution stopped (R01: partial completion stays reportable).
+#[derive(Debug, Default)]
+pub struct SyncExecutionOutcome {
+    pub applied: usize,
+    pub warnings: Vec<String>,
+    pub error: Option<VfsError>,
+}
+
+/// Visible retire name for a destination being replaced:
+/// `<name>.manifold-old-<pid>-<seq>` in the same parent directory.
+fn retired_sibling_path(dst_path: &str) -> String {
+    static RETIRE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = RETIRE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let (parent, name) = match dst_path.rsplit_once('/') {
+        Some((p, n)) => (p, n),
+        None => ("", dst_path),
+    };
+    format!("{parent}/{name}.manifold-old-{}-{seq}", std::process::id())
+}
+
+/// What the plan believed existed at the destination when it was built.
+/// `None` = absent, `Some(true)` = directory, `Some(false)` = file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DstAtPlan {
+    Absent,
+    WasFile,
+    WasDir,
+}
+
+impl DstAtPlan {
+    fn from_meta(meta: Option<&FileMetadata>) -> Self {
+        match meta {
+            None => DstAtPlan::Absent,
+            Some(m) if m.is_dir => DstAtPlan::WasDir,
+            Some(_) => DstAtPlan::WasFile,
+        }
+    }
+}
+
+/// Current destination state classified for replacement decisions.
+enum DstNow {
+    Absent,
+    Dir,
+    File,
+}
+
+fn classify_dst(dst: &dyn FileSystemBackend, dst_path: &str) -> Result<DstNow, VfsError> {
+    match dst.metadata(dst_path) {
+        Ok(m) => Ok(if m.is_dir { DstNow::Dir } else { DstNow::File }),
+        Err(VfsError::NotFound(_)) => Ok(DstNow::Absent),
+        Err(e) => Err(e),
+    }
+}
+
+/// Publishes the staged file `part_path` onto `dst_path` without ever
+/// destroying the existing target before the replacement is live (R01):
+///
+/// - destination absent: plain rename;
+/// - destination file: atomic rename replace (only when the plan approved
+///   replacing a file);
+/// - destination directory: move it aside to a visible retired name,
+///   publish, then delete the retired copy; a failed publish rolls the
+///   original directory back into place;
+/// - destination appeared or changed type since planning: refuse and keep
+///   both the staged content and the foreign destination.
+///
+/// Returns non-fatal warnings (e.g. a retired backup that could not be
+/// deleted after a successful publish).
+fn publish_staged_file(
+    dst: &dyn FileSystemBackend,
+    part_path: &str,
+    dst_path: &str,
+    relative: &str,
+    plan: DstAtPlan,
+) -> Result<Vec<String>, VfsError> {
+    let mut warnings = Vec::new();
+    match classify_dst(dst, dst_path).map_err(|e| err_for(relative, e))? {
+        DstNow::Absent => {
+            dst.rename(part_path, dst_path)
+                .map_err(|e| err_for(relative, e))?;
+        }
+        DstNow::File => match plan {
+            DstAtPlan::WasFile => {
+                dst.rename(part_path, dst_path)
+                    .map_err(|e| err_for(relative, e))?;
+            }
+            _ => {
+                return Err(VfsError::OperationFailed(
+                    relative.to_string(),
+                    format!(
+                        "destination {dst_path} appeared or changed type since the plan \
+                         was built; refusing to overwrite it. New content kept at {part_path}"
+                    ),
+                ));
+            }
+        },
+        DstNow::Dir => match plan {
+            DstAtPlan::WasDir => {
+                let bak = retired_sibling_path(dst_path);
+                dst.rename(dst_path, &bak)
+                    .map_err(|e| err_for(relative, e))?;
+                match dst.rename(part_path, dst_path) {
+                    Ok(()) => {
+                        // Approved destructive step: the replaced directory
+                        // is no longer needed once the new file is published.
+                        if let Err(e) = dst.remove(&bak, true) {
+                            warnings.push(format!(
+                                "replacement of {dst_path} published, but retiring the old \
+                                 directory failed ({e}); old content kept at {bak}"
+                            ));
+                        }
+                    }
+                    Err(e) => match dst.rename(&bak, dst_path) {
+                        Ok(()) => {
+                            return Err(VfsError::OperationFailed(
+                                relative.to_string(),
+                                format!(
+                                    "publishing the replacement for {dst_path} failed ({e}); \
+                                     the original directory was restored, new content kept \
+                                     at {part_path}"
+                                ),
+                            ));
+                        }
+                        Err(re) => {
+                            return Err(VfsError::OperationFailed(
+                                relative.to_string(),
+                                format!(
+                                    "publishing the replacement for {dst_path} failed ({e}) \
+                                     AND restoring the original directory failed ({re}); \
+                                     original directory kept at {bak}, new content kept at \
+                                     {part_path}"
+                                ),
+                            ));
+                        }
+                    },
+                }
+            }
+            _ => {
+                return Err(VfsError::OperationFailed(
+                    relative.to_string(),
+                    format!(
+                        "destination {dst_path} is a directory but the plan expected \
+                         {plan:?}; refusing to replace it. New content kept at {part_path}"
+                    ),
+                ));
+            }
+        },
+    }
+    Ok(warnings)
+}
+
+/// Makes `dst_path` a directory, preserving an existing approved file
+/// target until the new directory is live (R01). Mirrors
+/// [`publish_staged_file`] for the directory-replaces-file case.
+fn replace_with_directory(
+    dst: &dyn FileSystemBackend,
+    dst_path: &str,
+    relative: &str,
+    plan: DstAtPlan,
+) -> Result<Vec<String>, VfsError> {
+    let mut warnings = Vec::new();
+    match classify_dst(dst, dst_path).map_err(|e| err_for(relative, e))? {
+        DstNow::Dir => {
+            // Already a directory (approved or concurrently created as one):
+            // ensure the path exists; contents merge per the sync plan.
+            dst.create_dir(dst_path).map_err(|e| err_for(relative, e))?;
+        }
+        DstNow::Absent => {
+            dst.create_dir(dst_path).map_err(|e| err_for(relative, e))?;
+        }
+        DstNow::File => {
+            if plan != DstAtPlan::WasFile {
+                return Err(VfsError::OperationFailed(
+                    relative.to_string(),
+                    format!(
+                        "destination {dst_path} is a file but the plan expected \
+                         {plan:?}; refusing to replace it with a directory"
+                    ),
+                ));
+            }
+            let bak = retired_sibling_path(dst_path);
+            dst.rename(dst_path, &bak)
+                .map_err(|e| err_for(relative, e))?;
+            match dst.create_dir(dst_path) {
+                Ok(()) => {
+                    if let Err(e) = dst.remove(&bak, false) {
+                        warnings.push(format!(
+                            "replacement of {dst_path} with a directory published, but \
+                             retiring the old file failed ({e}); old content kept at {bak}"
+                        ));
+                    }
+                }
+                Err(e) => match dst.rename(&bak, dst_path) {
+                    Ok(()) => {
+                        return Err(VfsError::OperationFailed(
+                            relative.to_string(),
+                            format!(
+                                "creating the directory {dst_path} failed ({e}); the \
+                                 original file was restored"
+                            ),
+                        ));
+                    }
+                    Err(re) => {
+                        return Err(VfsError::OperationFailed(
+                            relative.to_string(),
+                            format!(
+                                "creating the directory {dst_path} failed ({e}) AND \
+                                 restoring the original file failed ({re}); original file \
+                                 kept at {bak}"
+                            ),
+                        ));
+                    }
+                },
+            }
+        }
+    }
+    Ok(warnings)
+}
+
 /// Copies one file entry from `src` to `dst` safely (F-21):
 /// - streams via `read_range`/`append_bytes` when the destination supports
 ///   efficient chunked I/O (local filesystem), otherwise buffers once;
 /// - stages into a part path and validates the size before publishing;
-/// - replaces an existing target only after the new content is prepared:
-///   files via atomic rename, directories via removal + rename with the
-///   staged content kept at the part path if publishing fails.
+/// - publishes via [`publish_staged_file`], which never removes an
+///   existing target before the replacement is live (R01).
 fn copy_file_safely(
     src: &dyn FileSystemBackend,
     dst: &dyn FileSystemBackend,
     src_path: &str,
     dst_path: &str,
     relative: &str,
-) -> Result<(), VfsError> {
+    plan: DstAtPlan,
+) -> Result<Vec<String>, VfsError> {
     const CHUNK: usize = 4 * 1024 * 1024;
     static PART_SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -448,22 +703,8 @@ fn copy_file_safely(
         staged?;
     }
 
-    // Replace the existing target only after the new content is ready.
-    if let Ok(meta) = dst.metadata(dst_path) {
-        if meta.is_dir {
-            dst.remove(dst_path, true)
-                .map_err(|e| err_for(relative, e))?;
-        }
-    }
-    if let Err(e) = dst.rename(&part_path, dst_path) {
-        return Err(VfsError::OperationFailed(
-            relative.to_string(),
-            format!(
-                "publishing the prepared replacement failed ({e}); new content kept at {part_path}"
-            ),
-        ));
-    }
-    Ok(())
+    // Publish without ever removing the existing target first (R01).
+    publish_staged_file(dst, &part_path, dst_path, relative, plan)
 }
 
 fn join_vfs_path(root: &str, child: &str) -> String {
@@ -1116,7 +1357,7 @@ fn replace_last(haystack: &str, needle: &str, replacement: &str, case_sensitive:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use manifold_vfs::{ArchiveBackend, ArchiveFormat};
+    use manifold_vfs::{ArchiveBackend, ArchiveFormat, ColorLabel, VolumeStats};
 
     #[test]
     fn test_directory_sync_sha256_changeset_and_execution() {
@@ -1139,7 +1380,9 @@ mod tests {
         let plan = plan.unwrap();
 
         assert_eq!(plan.entries.len(), 3);
-        let applied = plan.execute(&left, &right).unwrap();
+        let outcome = plan.execute(&left, &right);
+        assert!(outcome.error.is_none(), "sync failed: {:?}", outcome.error);
+        let applied = outcome.applied;
         assert_eq!(applied, 3);
 
         assert_eq!(right.read_bytes("/activate.php").unwrap(), b"v2");
@@ -1257,7 +1500,9 @@ mod tests {
             ComparisonMode::ContentHash,
         )
         .unwrap();
-        let applied = plan.execute(&left, &right).unwrap();
+        let outcome = plan.execute(&left, &right);
+        assert!(outcome.error.is_none(), "sync failed: {:?}", outcome.error);
+        let applied = outcome.applied;
         assert!(applied >= 2);
         assert_eq!(
             right.read_bytes("/sub/nested/app.rs").unwrap(),
@@ -1279,7 +1524,7 @@ mod tests {
             ComparisonMode::Metadata,
         )
         .unwrap();
-        plan2.execute(&left2, &right2).unwrap();
+        assert!(plan2.execute(&left2, &right2).error.is_none());
         assert_eq!(right2.read_bytes("/swap/inner.txt").unwrap(), b"hello");
 
         let mod_renamer = BatchRenamer::new(vec![
@@ -1345,7 +1590,9 @@ mod tests {
             ComparisonMode::ContentHash,
         )
         .unwrap();
-        let applied = plan.execute(&left, &right).unwrap();
+        let outcome = plan.execute(&left, &right);
+        assert!(outcome.error.is_none(), "sync failed: {:?}", outcome.error);
+        let applied = outcome.applied;
         assert!(applied >= 2);
         assert_eq!(right.read_bytes("big.bin").unwrap(), payload);
         assert_eq!(right.read_bytes("small.txt").unwrap(), b"hi");
@@ -1384,7 +1631,7 @@ mod tests {
             ComparisonMode::Metadata,
         )
         .unwrap();
-        plan.execute(&left, &right).unwrap();
+        assert!(plan.execute(&left, &right).error.is_none());
 
         let meta = right.metadata("swap.txt").unwrap();
         assert!(!meta.is_dir, "target directory must have been replaced");
@@ -1422,18 +1669,333 @@ mod tests {
         let res = plan.execute(&left, &right);
 
         std::fs::set_permissions(rtmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let err = match res {
-            Ok(_applied) => {
+        let err = match res.error {
+            None => {
                 // Some filesystems/names may still allow the delete; then
                 // there is nothing to assert beyond success.
                 return;
             }
-            Err(e) => e,
+            Some(e) => e,
         };
         let msg = err.to_string();
         assert!(
             msg.contains("locked_dir"),
             "error must carry the relative path, got: {msg}"
+        );
+    }
+
+    // ---- R01: destructive sync operations must never lose the target ----
+
+    /// Wraps a `LocalFsBackend` and fails the Nth (1-based) call of the
+    /// named operation with a synthetic I/O error (deterministic fault
+    /// injection for the publish/rollback paths).
+    struct FaultBackend {
+        inner: manifold_vfs::LocalFsBackend,
+        fail_create_dir: std::sync::Mutex<Vec<usize>>,
+        fail_rename: std::sync::Mutex<Vec<usize>>,
+        fail_remove: std::sync::Mutex<Vec<usize>>,
+        n_create_dir: std::sync::atomic::AtomicUsize,
+        n_rename: std::sync::atomic::AtomicUsize,
+        n_remove: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FaultBackend {
+        fn new(inner: manifold_vfs::LocalFsBackend) -> Self {
+            Self {
+                inner,
+                fail_create_dir: std::sync::Mutex::new(Vec::new()),
+                fail_rename: std::sync::Mutex::new(Vec::new()),
+                fail_remove: std::sync::Mutex::new(Vec::new()),
+                n_create_dir: std::sync::atomic::AtomicUsize::new(0),
+                n_rename: std::sync::atomic::AtomicUsize::new(0),
+                n_remove: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn injected() -> manifold_vfs::VfsError {
+            manifold_vfs::VfsError::IoError(std::io::Error::other("injected fault"))
+        }
+        fn route<T>(
+            counter: &std::sync::atomic::AtomicUsize,
+            failures: &std::sync::Mutex<Vec<usize>>,
+            run: impl FnOnce() -> Result<T, manifold_vfs::VfsError>,
+        ) -> Result<T, manifold_vfs::VfsError> {
+            let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if failures.lock().unwrap().contains(&n) {
+                return Err(Self::injected());
+            }
+            run()
+        }
+    }
+
+    impl manifold_vfs::FileSystemBackend for FaultBackend {
+        fn scheme(&self) -> &str {
+            "fault"
+        }
+        fn list_directory(&self, path: &str) -> Result<Vec<FileMetadata>, VfsError> {
+            self.inner.list_directory(path)
+        }
+        fn metadata(&self, path: &str) -> Result<FileMetadata, VfsError> {
+            self.inner.metadata(path)
+        }
+        fn volume_stats(&self, path: &str) -> Result<VolumeStats, VfsError> {
+            self.inner.volume_stats(path)
+        }
+        fn create_dir(&self, path: &str) -> Result<(), VfsError> {
+            Self::route(&self.n_create_dir, &self.fail_create_dir, || {
+                self.inner.create_dir(path)
+            })
+        }
+        fn remove(&self, path: &str, recursive: bool) -> Result<(), VfsError> {
+            Self::route(&self.n_remove, &self.fail_remove, || {
+                self.inner.remove(path, recursive)
+            })
+        }
+        fn rename(&self, from: &str, to: &str) -> Result<(), VfsError> {
+            Self::route(&self.n_rename, &self.fail_rename, || {
+                self.inner.rename(from, to)
+            })
+        }
+        fn copy_file(&self, from: &str, to: &str) -> Result<(), VfsError> {
+            self.inner.copy_file(from, to)
+        }
+        fn read_bytes(&self, path: &str) -> Result<Vec<u8>, VfsError> {
+            self.inner.read_bytes(path)
+        }
+        fn read_range(&self, path: &str, offset: u64, length: usize) -> Result<Vec<u8>, VfsError> {
+            self.inner.read_range(path, offset, length)
+        }
+        fn supports_chunked_io(&self) -> bool {
+            self.inner.supports_chunked_io()
+        }
+        fn write_bytes(&self, path: &str, data: &[u8]) -> Result<(), VfsError> {
+            self.inner.write_bytes(path, data)
+        }
+        fn append_bytes(&self, path: &str, data: &[u8]) -> Result<(), VfsError> {
+            self.inner.append_bytes(path, data)
+        }
+        fn set_permissions(&self, path: &str, mode: u32) -> Result<(), VfsError> {
+            self.inner.set_permissions(path, mode)
+        }
+        fn set_color_label(&self, path: &str, label: ColorLabel) -> Result<(), VfsError> {
+            self.inner.set_color_label(path, label)
+        }
+        fn set_hide_extension(&self, path: &str, hide: bool) -> Result<(), VfsError> {
+            self.inner.set_hide_extension(path, hide)
+        }
+        fn set_locked(&self, path: &str, locked: bool) -> Result<(), VfsError> {
+            self.inner.set_locked(path, locked)
+        }
+    }
+
+    fn plan_l2r(left: &dyn FileSystemBackend, right: &dyn FileSystemBackend) -> SyncExecutionPlan {
+        SyncExecutionPlan::build(
+            left,
+            "/",
+            right,
+            "/",
+            SyncStrategy::LeftToRight,
+            ComparisonMode::Metadata,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sync_preserves_directory_when_file_publish_fails() {
+        let ltmp = tempfile::tempdir().unwrap();
+        let rtmp = tempfile::tempdir().unwrap();
+        let left = manifold_vfs::LocalFsBackend::with_sandbox_root(ltmp.path()).unwrap();
+        let right = manifold_vfs::LocalFsBackend::with_sandbox_root(rtmp.path()).unwrap();
+        left.write_bytes("victim.txt", b"new-file-content").unwrap();
+        right
+            .write_bytes("victim.txt/old.txt", b"old-content")
+            .unwrap();
+
+        let plan = plan_l2r(&left, &right);
+        let fault = FaultBackend::new(
+            manifold_vfs::LocalFsBackend::with_sandbox_root(rtmp.path()).unwrap(),
+        );
+        // rename #1 = move-aside (ok), #2 = publish (fail), #3 = rollback (ok).
+        *fault.fail_rename.lock().unwrap() = vec![2];
+
+        let outcome = plan.execute(&left, &fault);
+        let err = outcome.error.expect("publish failure must be reported");
+        assert!(
+            err.to_string().contains("original directory was restored"),
+            "got: {err}"
+        );
+        // The directory and its content survived the failed replacement.
+        assert_eq!(
+            right.read_bytes("victim.txt/old.txt").unwrap(),
+            b"old-content",
+            "directory content must survive a failed publish"
+        );
+        // Rollback left no retired backup behind.
+        let leftovers: Vec<_> = std::fs::read_dir(rtmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".manifold-old-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "rollback must not leave backups: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn sync_preserves_file_when_directory_creation_fails() {
+        let ltmp = tempfile::tempdir().unwrap();
+        let rtmp = tempfile::tempdir().unwrap();
+        let left = manifold_vfs::LocalFsBackend::with_sandbox_root(ltmp.path()).unwrap();
+        let right = manifold_vfs::LocalFsBackend::with_sandbox_root(rtmp.path()).unwrap();
+        left.create_dir("swap").unwrap();
+        left.write_bytes("swap/inner.txt", b"hello").unwrap();
+        right.write_bytes("swap", b"was_a_file").unwrap();
+
+        let plan = plan_l2r(&left, &right);
+        let fault = FaultBackend::new(
+            manifold_vfs::LocalFsBackend::with_sandbox_root(rtmp.path()).unwrap(),
+        );
+        *fault.fail_create_dir.lock().unwrap() = vec![1];
+
+        let outcome = plan.execute(&left, &fault);
+        let err = outcome.error.expect("create_dir failure must be reported");
+        assert!(
+            err.to_string().contains("original file was restored"),
+            "got: {err}"
+        );
+        let meta = right.metadata("swap").unwrap();
+        assert!(!meta.is_dir, "the original file must be back in place");
+        assert_eq!(right.read_bytes("swap").unwrap(), b"was_a_file");
+    }
+
+    #[test]
+    fn sync_restores_original_after_failed_replacement() {
+        // Same scenario as the publish-failure test but verifies the
+        // restored directory stays fully usable afterwards.
+        let ltmp = tempfile::tempdir().unwrap();
+        let rtmp = tempfile::tempdir().unwrap();
+        let left = manifold_vfs::LocalFsBackend::with_sandbox_root(ltmp.path()).unwrap();
+        let right = manifold_vfs::LocalFsBackend::with_sandbox_root(rtmp.path()).unwrap();
+        left.write_bytes("victim.txt", b"new").unwrap();
+        right.write_bytes("victim.txt/a.txt", b"AA").unwrap();
+        right.write_bytes("victim.txt/b.txt", b"BB").unwrap();
+
+        let plan = plan_l2r(&left, &right);
+        let fault = FaultBackend::new(
+            manifold_vfs::LocalFsBackend::with_sandbox_root(rtmp.path()).unwrap(),
+        );
+        *fault.fail_rename.lock().unwrap() = vec![2];
+        assert!(plan.execute(&left, &fault).error.is_some());
+
+        assert_eq!(right.read_bytes("victim.txt/a.txt").unwrap(), b"AA");
+        assert_eq!(right.read_bytes("victim.txt/b.txt").unwrap(), b"BB");
+        // A second, working attempt now succeeds with the same plan.
+        let ok = plan.execute(&left, &right);
+        assert!(ok.error.is_none(), "{:?}", ok.error);
+        assert_eq!(right.read_bytes("victim.txt").unwrap(), b"new");
+    }
+
+    #[test]
+    fn sync_reports_rollback_failure_without_deleting_backup() {
+        let ltmp = tempfile::tempdir().unwrap();
+        let rtmp = tempfile::tempdir().unwrap();
+        let left = manifold_vfs::LocalFsBackend::with_sandbox_root(ltmp.path()).unwrap();
+        let right = manifold_vfs::LocalFsBackend::with_sandbox_root(rtmp.path()).unwrap();
+        left.write_bytes("victim.txt", b"new").unwrap();
+        right
+            .write_bytes("victim.txt/old.txt", b"old-content")
+            .unwrap();
+
+        let plan = plan_l2r(&left, &right);
+        let fault = FaultBackend::new(
+            manifold_vfs::LocalFsBackend::with_sandbox_root(rtmp.path()).unwrap(),
+        );
+        // Publish (#2) AND rollback (#3) both fail.
+        *fault.fail_rename.lock().unwrap() = vec![2, 3];
+
+        let outcome = plan.execute(&left, &fault);
+        let err = outcome.error.expect("double failure must be reported");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("restoring the original directory failed"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("manifold-old"),
+            "error must name the backup: {msg}"
+        );
+        // The retired backup directory still holds the original content.
+        let backups: Vec<_> = std::fs::read_dir(rtmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".manifold-old-"))
+            .collect();
+        assert_eq!(backups.len(), 1, "exactly one backup must remain");
+        let bak = backups[0].path().join("old.txt");
+        assert_eq!(std::fs::read(&bak).unwrap(), b"old-content");
+    }
+
+    #[test]
+    fn sync_does_not_overwrite_concurrently_created_destination() {
+        let ltmp = tempfile::tempdir().unwrap();
+        let rtmp = tempfile::tempdir().unwrap();
+        let left = manifold_vfs::LocalFsBackend::with_sandbox_root(ltmp.path()).unwrap();
+        let right = manifold_vfs::LocalFsBackend::with_sandbox_root(rtmp.path()).unwrap();
+        left.write_bytes("c.txt", b"planned-new").unwrap();
+
+        let mut plan = plan_l2r(&left, &right);
+        for e in &mut plan.entries {
+            e.approved = true;
+        }
+        assert!(
+            plan.entries
+                .iter()
+                .any(|e| e.relative_path == "c.txt" && e.right_meta.is_none()),
+            "plan must expect c.txt to be absent"
+        );
+        // A different process creates the destination after planning.
+        right.write_bytes("c.txt", b"foreign-content").unwrap();
+
+        let outcome = plan.execute(&left, &right);
+        let err = outcome.error.expect("concurrent creation must be refused");
+        assert!(err.to_string().contains("appeared"), "got: {err}");
+        assert_eq!(
+            right.read_bytes("c.txt").unwrap(),
+            b"foreign-content",
+            "the foreign destination must not be touched"
+        );
+    }
+
+    #[test]
+    fn sync_reports_partial_completion_accurately() {
+        let ltmp = tempfile::tempdir().unwrap();
+        let rtmp = tempfile::tempdir().unwrap();
+        let left = manifold_vfs::LocalFsBackend::with_sandbox_root(ltmp.path()).unwrap();
+        let right = manifold_vfs::LocalFsBackend::with_sandbox_root(rtmp.path()).unwrap();
+        left.write_bytes("a.txt", b"1").unwrap();
+        left.write_bytes("b.txt", b"2").unwrap();
+
+        let plan = plan_l2r(&left, &right);
+        let fault = FaultBackend::new(
+            manifold_vfs::LocalFsBackend::with_sandbox_root(rtmp.path()).unwrap(),
+        );
+        // Entry a publishes via rename #1 (ok); entry b fails on rename #2.
+        *fault.fail_rename.lock().unwrap() = vec![2];
+
+        let outcome = plan.execute(&left, &fault);
+        assert_eq!(
+            outcome.applied, 1,
+            "exactly one entry applied before failure"
+        );
+        let err = outcome.error.expect("failure must be reported");
+        assert!(
+            err.to_string().contains("b.txt"),
+            "error names the entry: {err}"
+        );
+        assert_eq!(fault.read_bytes("a.txt").unwrap(), b"1");
+        assert!(
+            right.metadata("b.txt").is_err(),
+            "b.txt must not be published"
         );
     }
 }

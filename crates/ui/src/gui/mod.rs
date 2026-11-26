@@ -9638,9 +9638,19 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                         sync_sync_modal_to_window(&w, &guard);
                         need_full_sync = true;
                     }
-                    BgSyncEvent::ExecFinished { dest_dir, result } => {
+                    BgSyncEvent::ExecFinished {
+                        dest_dir,
+                        result,
+                        warnings,
+                    } => {
                         guard.sync_running = false;
                         guard.bg_tasks_in_flight = guard.bg_tasks_in_flight.saturating_sub(1);
+                        for w in &warnings {
+                            guard.logs.push(format!("[SYNC_WARN] {w}"));
+                        }
+                        if !warnings.is_empty() {
+                            guard.show_toast("info", warnings[0].clone());
+                        }
                         match result {
                             Ok((total, applied)) => {
                                 let msg = format!(
