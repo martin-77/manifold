@@ -802,7 +802,12 @@ pub(super) fn swap_local_staged_into_place(part_path: &Path, dst_path: &str) -> 
                 let _ = std::fs::rename(part_path, retired);
             }
             if let Some(parent) = dst.parent() {
-                manifold_vfs::sync_dir(parent);
+                manifold_vfs::sync_dir(parent).map_err(|e| {
+                    format!(
+                        "swap published but the directory sync failed ({e}); \
+                             content is in place but may not survive a power loss"
+                    )
+                })?;
             }
             return Ok(());
         }
@@ -847,7 +852,12 @@ pub(super) fn swap_local_staged_into_place(part_path: &Path, dst_path: &str) -> 
         let _ = std::fs::remove_dir_all(&bak_path);
         let _ = std::fs::remove_file(&journal);
         if let Some(parent) = dst.parent() {
-            manifold_vfs::sync_dir(parent);
+            manifold_vfs::sync_dir(parent).map_err(|e| {
+                format!(
+                    "swap published but the directory sync failed ({e}); \
+                         content is in place but may not survive a power loss"
+                )
+            })?;
         }
         return Ok(());
     }
@@ -861,7 +871,12 @@ pub(super) fn swap_local_staged_into_place(part_path: &Path, dst_path: &str) -> 
         return Err(err.to_string());
     }
     if let Some(parent) = dst.parent() {
-        manifold_vfs::sync_dir(parent);
+        manifold_vfs::sync_dir(parent).map_err(|e| {
+            format!(
+                "rename published but the directory sync failed ({e}); \
+                     content is in place but may not survive a power loss"
+            )
+        })?;
     }
     Ok(())
 }

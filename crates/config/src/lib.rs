@@ -81,7 +81,9 @@ fn preserve_corrupt_config(path: &Path) -> Option<PathBuf> {
     let backup = path.with_file_name(format!("{file_name}.corrupt-{stamp}"));
     match fs::rename(path, &backup) {
         Ok(()) => {
-            manifold_vfs::sync_dir(parent);
+            // Best effort by design: this is itself the recovery fallback
+            // for a corrupted config, and the rename already succeeded.
+            let _ = manifold_vfs::sync_dir(parent);
             Some(backup)
         }
         Err(_) => None,

@@ -591,7 +591,7 @@ fn curl_download_atomically(
         return Err(VfsError::IoError(e));
     }
     if let Some(parent) = local_path.parent() {
-        manifold_vfs::sync_dir(parent);
+        manifold_vfs::sync_dir(parent).map_err(VfsError::IoError)?;
     }
     Ok(())
 }

@@ -458,18 +458,23 @@ pub fn current_local_civil_datetime() -> (i32, u32, u32, u32, u32) {
     system_time_to_civil(SystemTime::now())
 }
 
-/// fsyncs a directory so that a preceding `rename` is durable on unix
-/// (no-op on Windows, where NTFS journals metadata).
-pub fn sync_dir(dir: &Path) {
+/// Flushes a directory so that preceding creates/renames inside it are
+/// durable. Errors are surfaced to the caller (R04); call sites decide
+/// between propagating (data-critical paths) and explicitly accepting a
+/// best-effort flush.
+pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        if let Ok(fd) = fs::File::open(dir) {
-            let _ = fd.sync_all();
-        }
+        let fd = fs::File::open(dir)?;
+        fd.sync_all()?;
+        Ok(())
     }
     #[cfg(not(unix))]
     {
+        // Opening directories via std::fs is not supported on Windows and
+        // the NTFS rename is already transacted; nothing to flush.
         let _ = dir;
+        Ok(())
     }
 }
 
@@ -773,7 +778,7 @@ pub fn atomic_write_bytes(path: &Path, data: &[u8]) -> std::io::Result<()> {
         opts.mode(0o666);
     }
     let mut tmp = opts.open(&tmp_path)?;
-    if let Err(e) = tmp.write_all(data).and_then(|()| tmp.sync_all()) {
+    if let Err(e) = tmp.write_all(data) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e);
     }
@@ -797,12 +802,21 @@ pub fn atomic_write_bytes(path: &Path, data: &[u8]) -> std::io::Result<()> {
         let _ = fs::set_permissions(&tmp_path, m.permissions());
     }
 
+    // Flush content AND the metadata applied above to stable storage
+    // before publishing the rename, so a crash can neither expose a
+    // truncated file nor lose the preserved mode/xattrs (R04).
+    let tmp = fs::File::open(&tmp_path)?;
+    if let Err(e) = tmp.sync_all() {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    drop(tmp);
+
     if let Err(e) = fs::rename(&tmp_path, &final_path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(e);
     }
-    sync_dir(dir);
-    Ok(())
+    sync_dir(dir)
 }
 
 static SECURE_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -3024,5 +3038,72 @@ mod archive_json_tests {
             0o640,
             "overwrite must preserve the existing target mode"
         );
+    }
+
+    // ---- R04: durability failures must be observable ----
+
+    #[test]
+    fn sync_dir_reports_errors_instead_of_swallowing_them() {
+        let missing = std::env::temp_dir().join("manifold-sync-dir-does-not-exist-r04");
+        let _ = fs::remove_dir(&missing);
+        assert!(
+            sync_dir(&missing).is_err(),
+            "sync_dir on a missing directory must report an error"
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            sync_dir(tmp.path()).is_ok(),
+            "sync_dir on a real directory must succeed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_platform_metadata_on_overwrite() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("meta.txt");
+        fs::write(&target, b"old").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        // A finder/security-relevant xattr must survive the atomic swap.
+        let value = b"0042;5f4e3d2a;manifold-test;";
+        let rc = unsafe {
+            use std::os::unix::ffi::OsStrExt;
+            libc::setxattr(
+                target.as_os_str().as_bytes().as_ptr() as *const libc::c_char,
+                c"com.apple.quarantine".as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                0,
+                0,
+            )
+        };
+        if rc != 0 {
+            // Filesystem without xattr support: nothing to assert.
+            return;
+        }
+
+        atomic_write_bytes(&target, b"new-contents").unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"new-contents");
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "mode must survive the atomic overwrite"
+        );
+        let mut buf = [0u8; 32];
+        let n = unsafe {
+            use std::os::unix::ffi::OsStrExt;
+            libc::getxattr(
+                target.as_os_str().as_bytes().as_ptr() as *const libc::c_char,
+                c"com.apple.quarantine".as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                0,
+                0,
+            )
+        };
+        assert!(n > 0, "xattr must survive the atomic overwrite");
+        assert_eq!(&buf[..n as usize], value);
     }
 }
