@@ -1,0 +1,6 @@
+# Pin the project to the stable toolchain.
+# The workspace builds cleanly on stable (verified on 1.98.1); no nightly
+# features are used (`is_multiple_of` has been stable since 1.87).
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
