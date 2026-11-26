@@ -51,6 +51,14 @@ pub enum VfsError {
     /// underlying cause.
     #[error("Operation failed for '{0}': {1}")]
     OperationFailed(String, String),
+
+    /// F-17: A synchronization lock was poisoned because another thread
+    /// panicked while holding it. Operations fail with this error instead
+    /// of panicking (which would tear the whole GUI process down) and
+    /// without blanket `into_inner()` recovery (which would continue on
+    /// possibly corrupt invariants).
+    #[error("Internal state corrupted by a previous panic: {0}")]
+    PoisonedLock(String),
 }
 
 /// 8-swatch Color Label tag system matching the List View dots (`doc/image1.png`)
@@ -903,6 +911,26 @@ pub fn cleanup_secure_runtime_subdirs(subdirs: &[&str]) {
             }
         }
     }
+}
+
+/// F-17: Acquires a read lock without ever panicking on poisoning. The
+/// `what` label names the guarded structure for diagnostics. See
+/// [`VfsError::PoisonedLock`] for why `into_inner()` is not an option.
+pub fn lock_read<'a, T>(
+    lock: &'a RwLock<T>,
+    what: &str,
+) -> Result<std::sync::RwLockReadGuard<'a, T>, VfsError> {
+    lock.read()
+        .map_err(|e| VfsError::PoisonedLock(format!("{what}: {e}")))
+}
+
+/// F-17: Acquires a write lock without ever panicking on poisoning.
+pub fn lock_write<'a, T>(
+    lock: &'a RwLock<T>,
+    what: &str,
+) -> Result<std::sync::RwLockWriteGuard<'a, T>, VfsError> {
+    lock.write()
+        .map_err(|e| VfsError::PoisonedLock(format!("{what}: {e}")))
 }
 
 /// Guards a local path passed to CLI tools so leading `-` is never parsed as an option flag (`SEC-03`).
@@ -1850,7 +1878,7 @@ impl ArchiveBackend {
     pub fn insert_sized_placeholder(&self, path: &str, size_bytes: u64) -> Result<(), VfsError> {
         self.write_bytes(path, b"JFIF")?;
         let norm = Self::normalize_virtual_path(path)?;
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = crate::lock_write(&self.entries, "archive entries")?;
         if let Some(node) = entries.get_mut(&norm) {
             node.metadata.size = Some(size_bytes);
         }
@@ -1869,14 +1897,14 @@ impl ArchiveBackend {
         }
         if let Some((parent, _)) = norm.rsplit_once('/') {
             let parent_norm = if parent.is_empty() { "/" } else { parent };
-            let has_parent = self.entries.read().unwrap().contains_key(parent_norm);
+            let has_parent = crate::lock_read(&self.entries, "archive entries")?.contains_key(parent_norm);
             if !has_parent {
                 self.insert_metadata_only(parent_norm, 0, true)?;
             }
         }
         let name = norm.rsplit('/').next().unwrap_or(&norm).to_string();
         let (extension, kind) = infer_file_kind(&name, is_dir);
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = crate::lock_write(&self.entries, "archive entries")?;
         entries
             .entry(norm.clone())
             .or_insert_with(|| ArchiveEntryNode {
@@ -2176,7 +2204,7 @@ impl FileSystemBackend for ArchiveBackend {
 
     fn list_directory(&self, path: &str) -> Result<Vec<FileMetadata>, VfsError> {
         let dir_path = Self::normalize_virtual_path(path)?;
-        let entries = self.entries.read().unwrap();
+        let entries = crate::lock_read(&self.entries, "archive entries")?;
         if !entries.contains_key(&dir_path) {
             return Err(VfsError::NotFound(dir_path));
         }
@@ -2204,13 +2232,13 @@ impl FileSystemBackend for ArchiveBackend {
 
     fn metadata(&self, path: &str) -> Result<FileMetadata, VfsError> {
         let norm = Self::normalize_virtual_path(path)?;
-        let entries = self.entries.read().unwrap();
+        let entries = crate::lock_read(&self.entries, "archive entries")?;
         let found = entries.get(&norm).map(|n| n.metadata.clone());
         found.ok_or(VfsError::NotFound(norm))
     }
 
     fn volume_stats(&self, _path: &str) -> Result<VolumeStats, VfsError> {
-        let entries = self.entries.read().unwrap();
+        let entries = crate::lock_read(&self.entries, "archive entries")?;
         let used: u64 = entries.values().filter_map(|e| e.metadata.size).sum();
         Ok(VolumeStats {
             total_bytes: used,
@@ -2221,7 +2249,7 @@ impl FileSystemBackend for ArchiveBackend {
     fn create_dir(&self, path: &str) -> Result<(), VfsError> {
         let norm = Self::normalize_virtual_path(path)?;
         let mut accum = String::new();
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = crate::lock_write(&self.entries, "archive entries")?;
         for seg in norm.trim_matches('/').split('/').filter(|s| !s.is_empty()) {
             accum.push('/');
             accum.push_str(seg);
@@ -2256,7 +2284,7 @@ impl FileSystemBackend for ArchiveBackend {
 
     fn remove(&self, path: &str, recursive: bool) -> Result<(), VfsError> {
         let norm = Self::normalize_virtual_path(path)?;
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = crate::lock_write(&self.entries, "archive entries")?;
         if !entries.contains_key(&norm) {
             return Err(VfsError::NotFound(norm));
         }
@@ -2272,7 +2300,7 @@ impl FileSystemBackend for ArchiveBackend {
     fn rename(&self, from: &str, to: &str) -> Result<(), VfsError> {
         let src = Self::normalize_virtual_path(from)?;
         let dst = Self::normalize_virtual_path(to)?;
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = crate::lock_write(&self.entries, "archive entries")?;
         let mut node = entries.remove(&src).ok_or(VfsError::NotFound(src))?;
         node.metadata.name = dst.rsplit('/').next().unwrap_or(&dst).to_string();
         node.metadata.path = dst.clone();
@@ -2283,7 +2311,7 @@ impl FileSystemBackend for ArchiveBackend {
     fn copy_file(&self, from: &str, to: &str) -> Result<(), VfsError> {
         let src = Self::normalize_virtual_path(from)?;
         let dst = Self::normalize_virtual_path(to)?;
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = crate::lock_write(&self.entries, "archive entries")?;
         let mut node = entries.get(&src).cloned().ok_or(VfsError::NotFound(src))?;
         node.metadata.name = dst.rsplit('/').next().unwrap_or(&dst).to_string();
         node.metadata.path = dst.clone();
@@ -2294,7 +2322,7 @@ impl FileSystemBackend for ArchiveBackend {
     fn read_bytes(&self, path: &str) -> Result<Vec<u8>, VfsError> {
         let norm = Self::normalize_virtual_path(path)?;
         {
-            let entries = self.entries.read().unwrap();
+            let entries = crate::lock_read(&self.entries, "archive entries")?;
             let node = entries
                 .get(&norm)
                 .ok_or_else(|| VfsError::NotFound(norm.clone()))?;
@@ -2304,7 +2332,7 @@ impl FileSystemBackend for ArchiveBackend {
         }
         let bytes = extract_single_archive_member(&self.archive_path, self.format, &norm)?;
         if bytes.len() <= 16 * 1024 * 1024 {
-            let mut entries = self.entries.write().unwrap();
+            let mut entries = crate::lock_write(&self.entries, "archive entries")?;
             if let Some(node) = entries.get_mut(&norm) {
                 node.data = bytes.clone();
             }
@@ -2317,13 +2345,13 @@ impl FileSystemBackend for ArchiveBackend {
         // Ensure parent directories exist in the virtual index
         if let Some((parent, _)) = norm.rsplit_once('/') {
             let parent_norm = if parent.is_empty() { "/" } else { parent };
-            if !self.entries.read().unwrap().contains_key(parent_norm) {
+            if !crate::lock_read(&self.entries, "archive entries")?.contains_key(parent_norm) {
                 self.create_dir(parent_norm)?;
             }
         }
         let name = norm.rsplit('/').next().unwrap_or(&norm).to_string();
         let (extension, kind) = infer_file_kind(&name, false);
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = crate::lock_write(&self.entries, "archive entries")?;
         entries.insert(
             norm.clone(),
             ArchiveEntryNode {
@@ -2354,7 +2382,7 @@ impl FileSystemBackend for ArchiveBackend {
 
     fn set_permissions(&self, path: &str, mode: u32) -> Result<(), VfsError> {
         let norm = Self::normalize_virtual_path(path)?;
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = crate::lock_write(&self.entries, "archive entries")?;
         let node = entries.get_mut(&norm).ok_or(VfsError::NotFound(norm))?;
         node.metadata.permissions = mode & 0o7777;
         Ok(())
@@ -2362,7 +2390,7 @@ impl FileSystemBackend for ArchiveBackend {
 
     fn set_color_label(&self, path: &str, label: ColorLabel) -> Result<(), VfsError> {
         let norm = Self::normalize_virtual_path(path)?;
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = crate::lock_write(&self.entries, "archive entries")?;
         let node = entries.get_mut(&norm).ok_or(VfsError::NotFound(norm))?;
         node.metadata.color_label = label;
         Ok(())
@@ -2370,7 +2398,7 @@ impl FileSystemBackend for ArchiveBackend {
 
     fn set_hide_extension(&self, path: &str, hide: bool) -> Result<(), VfsError> {
         let norm = Self::normalize_virtual_path(path)?;
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = crate::lock_write(&self.entries, "archive entries")?;
         let node = entries.get_mut(&norm).ok_or(VfsError::NotFound(norm))?;
         node.metadata.hide_extension = hide;
         Ok(())
@@ -2378,7 +2406,7 @@ impl FileSystemBackend for ArchiveBackend {
 
     fn set_locked(&self, path: &str, locked: bool) -> Result<(), VfsError> {
         let norm = Self::normalize_virtual_path(path)?;
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = crate::lock_write(&self.entries, "archive entries")?;
         let node = entries.get_mut(&norm).ok_or(VfsError::NotFound(norm))?;
         node.metadata.is_locked = locked;
         Ok(())
@@ -2684,6 +2712,25 @@ mod tests {
         assert!(stats.total_bytes > 0);
         let avail_str = stats.format_available_gb();
         assert!(avail_str.ends_with("GB") || avail_str.ends_with("MB"));
+    }
+
+    #[test]
+    fn poisoned_locks_error_instead_of_panicking() {
+        // F-17: when another thread panics while holding the node lock,
+        // callers must get a clean error — not a panic (process teardown)
+        // and not a silent `into_inner()` continuation on unknown state.
+        let archive = ArchiveBackend::new("/tmp/poison.tar.gz", ArchiveFormat::TarGz);
+        let poison = archive.entries.clone();
+        let handle = std::thread::spawn(move || {
+            let _g = poison.write().unwrap();
+            panic!("simulated panic while holding the archive lock");
+        });
+        assert!(handle.join().is_err(), "poisoning thread must have panicked");
+        let err = archive.list_directory("/").unwrap_err();
+        assert!(
+            matches!(err, VfsError::PoisonedLock(_)),
+            "expected PoisonedLock, got {err:?}"
+        );
     }
 
     #[test]

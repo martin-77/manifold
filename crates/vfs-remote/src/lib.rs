@@ -18,8 +18,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use manifold_config::{AuthType, ConnectionProfile, ProtocolType};
 use manifold_vfs::{
-    create_secure_temp_file, secure_runtime_subdir, ColorLabel, FileMetadata, FileSystemBackend,
-    VfsError, VolumeStats,
+    create_secure_temp_file, lock_read, lock_write, secure_runtime_subdir, ColorLabel,
+    FileMetadata, FileSystemBackend, VfsError, VolumeStats,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -551,13 +551,13 @@ impl RemoteVfsBackend {
         };
         if let Some((parent, _)) = norm.rsplit_once('/') {
             let parent_norm = if parent.is_empty() { "/" } else { parent };
-            if !self.nodes.read().unwrap().contains_key(parent_norm) {
+            if !lock_read(&self.nodes, "remote nodes")?.contains_key(parent_norm) {
                 self.create_dir(parent_norm)?;
             }
         }
         let name = norm.rsplit('/').next().unwrap_or(&norm).to_string();
         let (extension, kind) = manifold_vfs::infer_file_kind(&name, false);
-        let mut nodes = self.nodes.write().unwrap();
+        let mut nodes = lock_write(&self.nodes, "remote nodes")?;
         nodes.insert(
             norm.clone(),
             RemoteNode {
@@ -641,7 +641,7 @@ impl RemoteVfsBackend {
                 }
             }
         }
-        let nodes = self.nodes.read().unwrap();
+        let nodes = lock_read(&self.nodes, "remote nodes")?;
         let found = nodes
             .get(&norm)
             .map(|n| n.data.clone())
@@ -659,11 +659,17 @@ impl RemoteVfsBackend {
     }
 
     pub fn is_connected(&self) -> bool {
-        *self.connected.read().unwrap()
+        // F-17: a poisoned flag must not panic; report "not connected" so
+        // operations fail with a clean error instead of crashing the app.
+        self.connected.read().is_ok_and(|c| *c)
     }
 
     pub fn disconnect(&self) {
-        *self.connected.write().unwrap() = false;
+        // F-17: poisoning here means the flag is already unreliable; the
+        // next operation observes the failure and errors out.
+        if let Ok(mut c) = self.connected.write() {
+            *c = false;
+        }
     }
 
     /// Recursively searches `base_dir` and its downstream subdirectories for entries matching `query`.
@@ -715,7 +721,7 @@ impl RemoteVfsBackend {
         } else {
             format!("{norm}/")
         };
-        let nodes = self.nodes.read().unwrap();
+        let nodes = lock_read(&self.nodes, "remote nodes")?;
         let mut results = Vec::new();
         for (path, node) in nodes.iter() {
             if path == &norm || !path.starts_with(&prefix) {
@@ -762,7 +768,11 @@ impl RemoteVfsBackend {
     }
 
     fn cache_listed_entries(&self, norm: &str, list: &[FileMetadata]) {
-        let mut nodes = self.nodes.write().unwrap();
+        // F-17: caching is best-effort; a poisoned node map must not panic
+        // here — the next listing simply repopulates it.
+        let Ok(mut nodes) = lock_write(&self.nodes, "remote nodes") else {
+            return;
+        };
         nodes.entry(norm.to_string()).or_insert_with(|| RemoteNode {
             metadata: FileMetadata {
                 name: norm.rsplit('/').next().unwrap_or("/").to_string(),
@@ -871,7 +881,7 @@ impl FileSystemBackend for RemoteVfsBackend {
             self.cache_listed_entries(&norm, &list);
             return Ok(list);
         }
-        let nodes = self.nodes.read().unwrap();
+        let nodes = lock_read(&self.nodes, "remote nodes")?;
         if !nodes.contains_key(&norm) {
             return Err(VfsError::NotFound(norm));
         }
@@ -904,7 +914,7 @@ impl FileSystemBackend for RemoteVfsBackend {
             .rsplit_once('/')
             .map(|(p, _)| if p.is_empty() { "/" } else { p })
             .unwrap_or("/");
-        let nodes = self.nodes.read().unwrap();
+        let nodes = lock_read(&self.nodes, "remote nodes")?;
         if let Some(n) = nodes.get(&norm) {
             return Ok(n.metadata.clone());
         }
@@ -949,7 +959,7 @@ impl FileSystemBackend for RemoteVfsBackend {
                         true,
                     );
                     if let Some(meta) = parsed.into_iter().next() {
-                        let mut nodes = self.nodes.write().unwrap();
+                        let mut nodes = lock_write(&self.nodes, "remote nodes")?;
                         nodes.insert(
                             norm,
                             RemoteNode {
@@ -1001,7 +1011,7 @@ impl FileSystemBackend for RemoteVfsBackend {
             }
         }
         let name = norm.rsplit('/').next().unwrap_or(&norm).to_string();
-        let mut nodes = self.nodes.write().unwrap();
+        let mut nodes = lock_write(&self.nodes, "remote nodes")?;
         nodes.insert(
             norm.clone(),
             RemoteNode {
@@ -1064,7 +1074,7 @@ impl FileSystemBackend for RemoteVfsBackend {
                 }
             }
         }
-        let mut nodes = self.nodes.write().unwrap();
+        let mut nodes = lock_write(&self.nodes, "remote nodes")?;
         if !self.live_mode && !nodes.contains_key(&norm) {
             return Err(VfsError::NotFound(norm));
         }
@@ -1111,7 +1121,7 @@ impl FileSystemBackend for RemoteVfsBackend {
                 }
             }
         }
-        let mut nodes = self.nodes.write().unwrap();
+        let mut nodes = lock_write(&self.nodes, "remote nodes")?;
         if let Some(mut node) = nodes.remove(&src) {
             node.metadata.name = dst.rsplit('/').next().unwrap_or(&dst).to_string();
             node.metadata.path = dst.clone();
@@ -1150,7 +1160,7 @@ impl FileSystemBackend for RemoteVfsBackend {
                 }
             }
         }
-        let mut nodes = self.nodes.write().unwrap();
+        let mut nodes = lock_write(&self.nodes, "remote nodes")?;
         let mut node = nodes.get(&src).cloned().ok_or(VfsError::NotFound(src))?;
         node.metadata.name = dst.rsplit('/').next().unwrap_or(&dst).to_string();
         node.metadata.path = dst.clone();
@@ -1200,7 +1210,7 @@ impl FileSystemBackend for RemoteVfsBackend {
                 }
             }
         }
-        let nodes = self.nodes.read().unwrap();
+        let nodes = lock_read(&self.nodes, "remote nodes")?;
         let found = nodes.get(&norm).map(|n| n.data.clone());
         found.ok_or(VfsError::NotFound(norm))
     }
@@ -1264,13 +1274,13 @@ impl FileSystemBackend for RemoteVfsBackend {
         }
         if let Some((parent, _)) = norm.rsplit_once('/') {
             let parent_norm = if parent.is_empty() { "/" } else { parent };
-            if !self.nodes.read().unwrap().contains_key(parent_norm) {
+            if !lock_read(&self.nodes, "remote nodes")?.contains_key(parent_norm) {
                 self.create_dir(parent_norm)?;
             }
         }
         let name = norm.rsplit('/').next().unwrap_or(&norm).to_string();
         let (extension, kind) = manifold_vfs::infer_file_kind(&name, false);
-        let mut nodes = self.nodes.write().unwrap();
+        let mut nodes = lock_write(&self.nodes, "remote nodes")?;
         nodes.insert(
             norm.clone(),
             RemoteNode {
@@ -1332,7 +1342,7 @@ impl FileSystemBackend for RemoteVfsBackend {
             existing.extend_from_slice(data);
             return self.write_bytes(&norm, &existing);
         }
-        let mut nodes = self.nodes.write().unwrap();
+        let mut nodes = lock_write(&self.nodes, "remote nodes")?;
         if let Some(node) = nodes.get_mut(&norm) {
             node.data.extend_from_slice(data);
             node.metadata.size = Some(node.data.len() as u64);
@@ -1364,7 +1374,7 @@ impl FileSystemBackend for RemoteVfsBackend {
             .unwrap_or(&link_norm)
             .to_string();
         let (extension, kind) = manifold_vfs::infer_file_kind(&name, false);
-        let mut nodes = self.nodes.write().unwrap();
+        let mut nodes = lock_write(&self.nodes, "remote nodes")?;
         nodes.insert(
             link_norm.clone(),
             RemoteNode {
@@ -1401,7 +1411,7 @@ impl FileSystemBackend for RemoteVfsBackend {
             let oct = format!("{:o}", mode & 0o7777);
             self.run_remote_shell(&format!("chmod {oct} -- '{esc}'"))?;
         }
-        let mut nodes = self.nodes.write().unwrap();
+        let mut nodes = lock_write(&self.nodes, "remote nodes")?;
         if let Some(node) = nodes.get_mut(&norm) {
             node.metadata.permissions = mode & 0o7777;
         } else if !self.live_mode {
@@ -1413,7 +1423,7 @@ impl FileSystemBackend for RemoteVfsBackend {
     fn set_color_label(&self, path: &str, label: ColorLabel) -> Result<(), VfsError> {
         self.ensure_connected()?;
         let norm = Self::normalize_remote_path(path)?;
-        let mut nodes = self.nodes.write().unwrap();
+        let mut nodes = lock_write(&self.nodes, "remote nodes")?;
         let node = nodes.get_mut(&norm).ok_or(VfsError::NotFound(norm))?;
         node.metadata.color_label = label;
         Ok(())
@@ -1422,7 +1432,7 @@ impl FileSystemBackend for RemoteVfsBackend {
     fn set_hide_extension(&self, path: &str, hide: bool) -> Result<(), VfsError> {
         self.ensure_connected()?;
         let norm = Self::normalize_remote_path(path)?;
-        let mut nodes = self.nodes.write().unwrap();
+        let mut nodes = lock_write(&self.nodes, "remote nodes")?;
         let node = nodes.get_mut(&norm).ok_or(VfsError::NotFound(norm))?;
         node.metadata.hide_extension = hide;
         Ok(())
@@ -1431,7 +1441,7 @@ impl FileSystemBackend for RemoteVfsBackend {
     fn set_locked(&self, path: &str, locked: bool) -> Result<(), VfsError> {
         self.ensure_connected()?;
         let norm = Self::normalize_remote_path(path)?;
-        let mut nodes = self.nodes.write().unwrap();
+        let mut nodes = lock_write(&self.nodes, "remote nodes")?;
         let node = nodes.get_mut(&norm).ok_or(VfsError::NotFound(norm))?;
         node.metadata.is_locked = locked;
         Ok(())
@@ -1875,7 +1885,7 @@ impl RemoteEditStagingManager {
         }
 
         let digest: [u8; 32] = Sha256::digest(&bytes).into();
-        let mut guard = self.staged_files.write().unwrap();
+        let mut guard = lock_write(&self.staged_files, "staged files")?;
         if let Some(existing) = guard
             .iter_mut()
             .find(|s| s.session_id == session_id && s.remote_path == remote_path)
@@ -1905,7 +1915,7 @@ impl RemoteEditStagingManager {
         session_id: Option<&str>,
         backend: &dyn FileSystemBackend,
     ) -> Result<usize, VfsError> {
-        let mut guard = self.staged_files.write().unwrap();
+        let mut guard = lock_write(&self.staged_files, "staged files")?;
         let mut uploaded = 0usize;
         for staged in guard.iter_mut() {
             if session_id.is_some_and(|sid| staged.session_id != sid) {
@@ -1944,7 +1954,11 @@ impl RemoteEditStagingManager {
 
     /// Returns all active session IDs that currently have staged files.
     pub fn active_session_ids(&self) -> Vec<String> {
-        let guard = self.staged_files.read().unwrap();
+        // F-17: poisoned lock → report no sessions instead of panicking;
+        // a later purge attempt will surface the real problem.
+        let Ok(guard) = lock_read(&self.staged_files, "staged files") else {
+            return Vec::new();
+        };
         let mut ids = Vec::new();
         for item in guard.iter() {
             if !ids.contains(&item.session_id) {
@@ -1956,7 +1970,7 @@ impl RemoteEditStagingManager {
 
     /// Purges all staged files for a given session or on application shutdown.
     pub fn purge_session(&self, session_id: &str) -> Result<(), VfsError> {
-        let mut guard = self.staged_files.write().unwrap();
+        let mut guard = lock_write(&self.staged_files, "staged files")?;
         guard.retain(|f| f.session_id != session_id);
         let session_dir = self.cache_root.join(session_id);
         if session_dir.exists() {
@@ -2236,6 +2250,27 @@ mod tests {
             .unwrap();
         assert_eq!(uploaded, 1);
         assert_eq!(remote.read_bytes("/notes.txt").unwrap(), b"v2 edited");
+    }
+
+    #[test]
+    fn poisoned_remote_nodes_lock_errors_not_panics() {
+        // F-17: same contract as the archive backend — poisoning surfaces
+        // as VfsError instead of crashing the GUI process.
+        let profile = ConnectionProfile::new_sftp_default("poison-sess", "Poison SFTP");
+        let remote = RemoteVfsBackend::connect(profile).unwrap();
+        let poison = remote.nodes.clone();
+        let handle = std::thread::spawn(move || {
+            let _g = poison.write().unwrap();
+            panic!("simulated panic while holding the remote node lock");
+        });
+        assert!(handle.join().is_err());
+        let err = remote.list_directory("/").unwrap_err();
+        assert!(
+            matches!(err, VfsError::PoisonedLock(_)),
+            "expected PoisonedLock, got {err:?}"
+        );
+        // The connection flag helpers must also survive poisoning.
+        assert!(remote.is_connected());
     }
 
     #[test]
