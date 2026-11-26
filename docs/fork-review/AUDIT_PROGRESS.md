@@ -24,7 +24,7 @@
 | F-4 | S3 recursive delete removes only prefix marker | static-path | productive (S3 browse/delete) | fixed | `5c7ff9e` |
 | F-5 | S3 list lacks pagination (>1000 keys) | static-path | productive | fixed | `5c7ff9e` |
 | F-6 | WebDAV MOVE always `Overwrite: T` | static-path | productive | fixed | `5c7ff9e` |
-| F-7 | macOS trash without Put-Back metadata | static-path | productive | open | — |
+| F-7 | macOS trash without Put-Back metadata | static-path | productive | fixed | `58402c0` |
 | F-8 | `copy_local_dir_preserving_bundle` removes target before rename | static-path | productive | fixed | `0824b8f` |
 | F-9 | `load_default` swallows TOML parse errors (config reset risk) | static-path | productive | fixed | `782a3a4` |
 | F-10 | Keychain write failures silently ignored | static-path | productive | fixed | `782a3a4` |
@@ -44,9 +44,9 @@
 | F-23 | Drag-out downloads synchronously on UI thread; staging never purged | static-path | productive | open | — |
 | F-24 | README claims stable 1.80+, but `is_multiple_of` needs 1.87 | static | n/a (docs) | open | — |
 | F-25 | No `deny.toml`, no CI, no LICENSE file, license metadata inconsistent | static | n/a (infra) | open | — |
-| F-26 | macOS file clipboard via osascript (no native flavors, single-file paste) | static-path | productive | open | — |
-| F-27 | Hand-rolled ObjC drag: leaks, fragile transmutes | static-path | productive | open | — |
-| F-28 | `smbclient` not present on macOS by default | static-path | productive | open | — |
+| F-26 | macOS file clipboard via osascript (no native flavors, single-file paste) | static-path | productive | fixed | `58402c0` |
+| F-27 | Hand-rolled ObjC drag: leaks, fragile transmutes | static-path | productive | fixed | `58402c0` |
+| F-28 | `smbclient` not present on macOS by default | static-path | productive | fixed | `58402c0` |
 | F-29 | Config in `~/.config` on macOS (do not migrate for cosmetics) | suggestion | — | rejected (keep, per brief) | — |
 | F-30 | Quarantine handling (must NOT be removed) | n/a | — | rejected (no change, per brief) | — |
 | F-31 | GCS/Azure routed through S3 SigV4 | static-potential | productive | fixed | `88cd6e6` |
