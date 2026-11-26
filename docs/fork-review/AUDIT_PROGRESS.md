@@ -19,7 +19,7 @@
 | ID | Summary | Evidence | Reachability | Status | Commit |
 |----|---------|----------|--------------|--------|--------|
 | F-1 | `LocalFsBackend::write_bytes` truncates target non-atomically | static-path | productive (sync, remote copy, new-file) | fixed | `94fbac3` |
-| F-2 | TransferEngine rename fallback deletes existing target | static-path | **library-only** (engine unused by GUI) | fixed | `3864de3` |
+| F-2 | TransferEngine rename fallback deletes existing target | static-path | **library-only** (engine unused by GUI) | fixed | `6a7cee3` |
 | F-3 | curl downloads truncate target on failure | static-path | partially mitigated (bg worker stages `.part`); sync remote copy path remains | fixed | `5c7ff9e` |
 | F-4 | S3 recursive delete removes only prefix marker | static-path | productive (S3 browse/delete) | fixed | `5c7ff9e` |
 | F-5 | S3 list lacks pagination (>1000 keys) | static-path | productive | fixed | `5c7ff9e` |
@@ -30,9 +30,9 @@
 | F-10 | Keychain write failures silently ignored | static-path | productive | fixed | `782a3a4` |
 | F-11 | Hand-rolled archive JSON listing parser splits on `"],"` | static-path | productive (python3 archive path) | fixed | `88cd6e6` |
 | F-12 | python3 hard dependency (archive listing, SFTP PTY auth) | static-path | productive | fixed | `88cd6e6` |
-| F-13 | Engine `read_range` chunking O(n²) | static-path | library-only (see F-13b) | fixed | `3864de3` |
+| F-13 | Engine `read_range` chunking O(n²) | static-path | library-only (see F-13b) | fixed | `6a7cee3` |
 | F-13b | `LocalFsBackend` lacks `read_range` override → inspector loads whole file | static-path | productive (UI inspector) | fixed | `1e71659` |
-| F-14 | Engine ignores pause/cancel handle | static-path | library-only | fixed | `3864de3` |
+| F-14 | Engine ignores pause/cancel handle | static-path | library-only | fixed | `6a7cee3` |
 | F-15 | Fake remote volume stats (500 GB/470 GB) | static-path | productive | fixed | `5767099` |
 | F-16 | Preview placeholders (1920×1080, 120 s, page 1) | static-path | productive | fixed | `5767099` |
 | F-17 | RwLock poisoning panics (no blanket `into_inner` allowed) | static-potential | productive | fixed | `570d77e` |
