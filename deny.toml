@@ -11,7 +11,6 @@ all-features = false
 
 [advisories]
 # Use the advisory DB defaults; no blanket ignores.
-yanked-warnings = "warn"
 
 [licenses]
 # Only fail on unknown/unsupported license expressions.
@@ -35,6 +34,12 @@ allow = [
     "MPL-2.0",
     "LGPL-2.1",
     "LGPL-3.0",
+    # Slint is tri-licensed: GPL-3.0-only OR Slint Royalty-free license OR
+    # Slint Software License. The project uses Slint under the royalty-free
+    # option (see slint docs); the custom LicenseRefs are not in the SPDX
+    # database, hence listed here explicitly.
+    "LicenseRef-Slint-Royalty-free-2.0",
+    "LicenseRef-Slint-Software-3.0",
 ]
 confidence-threshold = 0.8
 
