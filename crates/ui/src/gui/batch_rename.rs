@@ -622,7 +622,7 @@ pub(super) fn reset_connect_modal_for_new(w: &ManifoldWindow) {
 
 pub(super) fn populate_connect_modal_from_profile(
     w: &ManifoldWindow,
-    guard: &GuiRuntime,
+    guard: &mut GuiRuntime,
     prof: &ConnectionProfile,
 ) {
     reset_connect_modal_for_new(w);
@@ -648,12 +648,7 @@ pub(super) fn populate_connect_modal_from_profile(
         AuthType::PublicKey => "private_key",
         _ => "password",
     };
-    let saved_sec = guard
-        .credential_store
-        .get_secret(&prof.id)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    let saved_sec = guard.get_secret_logged(&prof.id).unwrap_or_default();
 
     w.set_connect_editing_id(prof.id.clone().into());
     w.set_connect_name(prof.name.clone().into());

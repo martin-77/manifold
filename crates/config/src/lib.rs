@@ -34,6 +34,59 @@ pub enum ConfigError {
     Validation(String),
 }
 
+/// Notice emitted when a malformed configuration file was preserved
+/// instead of silently replaced by defaults (F-9). The UI shows this so
+/// users can restore the backup by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigRecoveryNotice {
+    /// The configuration file that could not be parsed.
+    pub file: PathBuf,
+    /// Where the original bytes were preserved.
+    pub backup: PathBuf,
+    /// Parser error message (no secret content).
+    pub error: String,
+}
+
+/// Preserves a malformed configuration file exactly once: moves it to
+/// `<name>.corrupt-<epoch-seconds>` next to the original and returns the
+/// backup path. If a backup with identical content already exists, no
+/// second copy is created — repeated starts never pile up duplicates
+/// (F-9). Files that do not exist or are empty are ignored.
+fn preserve_corrupt_config(path: &Path) -> Option<PathBuf> {
+    let raw = fs::read(path).ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    let file_name = path.file_name()?.to_string_lossy().to_string();
+    let parent = path.parent()?;
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&file_name) && name.contains(".corrupt-") {
+                if fs::read(entry.path()).ok().as_deref() == Some(raw.as_slice()) {
+                    // Identical content already preserved: drop the current
+                    // copy so the fresh default can be saved without
+                    // clobbering anything.
+                    let _ = fs::remove_file(path);
+                    return Some(entry.path());
+                }
+            }
+        }
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup = path.with_file_name(format!("{file_name}.corrupt-{stamp}"));
+    match fs::rename(path, &backup) {
+        Ok(()) => {
+            manifold_vfs::sync_dir(parent);
+            Some(backup)
+        }
+        Err(_) => None,
+    }
+}
+
 /// Supported remote & cloud protocols (`doc/image3.png` and `Section 3.2` of `BRIEF.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -298,8 +351,33 @@ impl ConnectionsConfig {
     }
 
     pub fn load_default() -> Self {
+        Self::load_default_with_recovery().0
+    }
+
+    /// Loads the connections file, preserving a malformed file exactly once
+    /// instead of silently replacing it with defaults (F-9). Returns the
+    /// configuration plus an optional recovery notice for the UI.
+    pub fn load_default_with_recovery() -> (Self, Option<ConfigRecoveryNotice>) {
         let path = Self::default_config_path();
-        Self::load_from_file(path).unwrap_or_default()
+        Self::load_from_file_with_recovery(path)
+    }
+
+    /// Path-parameterized variant of [`Self::load_default_with_recovery`].
+    pub fn load_from_file_with_recovery(
+        path: impl AsRef<Path>,
+    ) -> (Self, Option<ConfigRecoveryNotice>) {
+        let path = path.as_ref();
+        match Self::load_from_file(path) {
+            Ok(cfg) => (cfg, None),
+            Err(e) => {
+                let notice = preserve_corrupt_config(path).map(|backup| ConfigRecoveryNotice {
+                    file: path.to_path_buf(),
+                    backup,
+                    error: e.to_string(),
+                });
+                (Self::default(), notice)
+            }
+        }
     }
 
     pub fn save_default(&self) -> Result<(), ConfigError> {
@@ -373,6 +451,7 @@ mod win_cred {
     #[link(name = "advapi32")]
     extern "system" {
         fn CredWriteW(credential: *const CredentialW, flags: u32) -> i32;
+        fn GetLastError() -> u32;
         fn CredReadW(
             target_name: *const u16,
             cred_type: u32,
@@ -441,9 +520,20 @@ mod win_cred {
         result.filter(|s| !s.is_empty())
     }
 
-    pub fn delete_generic(target: &str) -> bool {
+    /// Returns Ok(()) on success or when the entry did not exist
+    /// (ERROR_NOT_FOUND); any other failure becomes an error string.
+    pub fn delete_generic(target: &str) -> Result<(), String> {
         let target_w = to_wide_nul(target);
-        unsafe { CredDeleteW(target_w.as_ptr(), CRED_TYPE_GENERIC, 0) != 0 }
+        let ok = unsafe { CredDeleteW(target_w.as_ptr(), CRED_TYPE_GENERIC, 0) != 0 };
+        if ok {
+            return Ok(());
+        }
+        const ERROR_NOT_FOUND: u32 = 2;
+        let code = unsafe { GetLastError() };
+        if code == ERROR_NOT_FOUND {
+            return Ok(());
+        }
+        Err(format!("CredDeleteW failed with OS error {code}"))
     }
 }
 
@@ -479,33 +569,59 @@ impl CredentialStore {
         ConfigError::Keyring("Keyring lock poisoned".to_string())
     }
 
+    /// Runs a `security -i` script on macOS via piped stdin (secrets never
+    /// appear in argv). Interactive mode reports failures on stdout while
+    /// still exiting 0, so both are inspected (F-10).
+    #[cfg(all(not(windows), target_os = "macos"))]
+    fn run_macos_security_script(script: &str) -> Result<(), ConfigError> {
+        let mut child = Command::new("security")
+            .arg("-i")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                ConfigError::Keyring(format!("Failed to launch macOS security tool: {e}"))
+            })?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(script.as_bytes()).map_err(|e| {
+                ConfigError::Keyring(format!("Failed to pipe command to macOS keychain: {e}"))
+            })?;
+        }
+        let out = child
+            .wait_with_output()
+            .map_err(|e| ConfigError::Keyring(format!("macOS security tool failed to run: {e}")))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        if !out.status.success() || stdout.contains("Error") {
+            let detail: String = stdout.chars().take(200).collect();
+            return Err(ConfigError::Keyring(format!(
+                "macOS keychain rejected the request: {}",
+                detail.trim()
+            )));
+        }
+        Ok(())
+    }
+
     pub fn set_secret(&self, connection_id: &str, secret: &str) -> Result<(), ConfigError> {
         if self.use_os_backend {
             #[cfg(windows)]
             {
                 let target = format!("{KEYRING_SERVICE_NAME}:{connection_id}");
-                let _ = win_cred::write_generic(&target, KEYRING_SERVICE_NAME, secret);
+                if !win_cred::write_generic(&target, KEYRING_SERVICE_NAME, secret) {
+                    return Err(ConfigError::Keyring(
+                        "Windows Credential Manager rejected the write".to_string(),
+                    ));
+                }
             }
             #[cfg(not(windows))]
             if cfg!(target_os = "macos") {
-                let child_res = Command::new("security")
-                    .arg("-i")
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn();
-                if let Ok(mut child) = child_res {
-                    if let Some(mut stdin) = child.stdin.take() {
-                        let svc = escape_macos_security_token(KEYRING_SERVICE_NAME);
-                        let acct = escape_macos_security_token(connection_id);
-                        let pw = escape_macos_security_token(secret);
-                        let cmd = format!("add-generic-password -U -s {svc} -a {acct} -w {pw}\n");
-                        let _ = stdin.write_all(cmd.as_bytes());
-                    }
-                    let _ = child.wait();
-                }
+                let svc = escape_macos_security_token(KEYRING_SERVICE_NAME);
+                let acct = escape_macos_security_token(connection_id);
+                let pw = escape_macos_security_token(secret);
+                let script = format!("add-generic-password -U -s {svc} -a {acct} -w {pw}\n");
+                Self::run_macos_security_script(&script)?;
             } else {
-                let child_res = Command::new("secret-tool")
+                let child = Command::new("secret-tool")
                     .args([
                         "store",
                         "--label=Manifold Credential",
@@ -516,13 +632,24 @@ impl CredentialStore {
                     ])
                     .stdin(Stdio::piped())
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn();
-                if let Ok(mut child) = child_res {
-                    if let Some(mut stdin) = child.stdin.take() {
-                        let _ = stdin.write_all(secret.as_bytes());
-                    }
-                    let _ = child.wait();
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| {
+                        ConfigError::Keyring(format!("Failed to launch secret-tool: {e}"))
+                    })?;
+                let mut child = child;
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(secret.as_bytes());
+                }
+                let out = child.wait_with_output().map_err(|e| {
+                    ConfigError::Keyring(format!("secret-tool store failed to run: {e}"))
+                })?;
+                if !out.status.success() {
+                    let detail = String::from_utf8_lossy(&out.stderr);
+                    return Err(ConfigError::Keyring(format!(
+                        "Secret service store failed: {}",
+                        detail.trim()
+                    )));
                 }
             }
         }
@@ -571,19 +698,36 @@ impl CredentialStore {
                             connection_id,
                         ])
                         .output()
-                };
-                if let Ok(out) = output {
-                    if out.status.success() {
-                        let s = String::from_utf8_lossy(&out.stdout)
-                            .trim_end_matches(&['\r', '\n'][..])
-                            .to_string();
-                        if !s.is_empty() {
-                            let mut guard = self.memory_vault.write().map_err(Self::lock_err)?;
-                            guard.insert(connection_id.to_string(), s.clone());
-                            return Ok(Some(s));
-                        }
-                    }
                 }
+                .map_err(|e| ConfigError::Keyring(format!("Keychain lookup could not run: {e}")))?;
+                if output.status.success() {
+                    let s = String::from_utf8_lossy(&output.stdout)
+                        .trim_end_matches(&['\r', '\n'][..])
+                        .to_string();
+                    if !s.is_empty() {
+                        let mut guard = self.memory_vault.write().map_err(Self::lock_err)?;
+                        guard.insert(connection_id.to_string(), s.clone());
+                        return Ok(Some(s));
+                    }
+                    return Ok(None);
+                }
+                // Distinguish "no such entry" from a real backend failure
+                // (locked or unavailable keychain) instead of pretending
+                // the credential simply does not exist (F-10).
+                let code = output.status.code().unwrap_or(-1);
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let not_found = if cfg!(target_os = "macos") {
+                    code == 44
+                } else {
+                    code == 1 && !stderr.contains("Error")
+                };
+                if not_found {
+                    return Ok(None);
+                }
+                let detail: String = stderr.trim().chars().take(200).collect();
+                return Err(ConfigError::Keyring(format!(
+                    "Keychain lookup failed (exit {code}): {detail}"
+                )));
             }
         }
         Ok(None)
@@ -594,11 +738,12 @@ impl CredentialStore {
             #[cfg(windows)]
             {
                 let target = format!("{KEYRING_SERVICE_NAME}:{connection_id}");
-                let _ = win_cred::delete_generic(&target);
+                // A missing entry is not an error (idempotent delete).
+                win_cred::delete_generic(&target).map_err(ConfigError::Keyring)?;
             }
             #[cfg(not(windows))]
             if cfg!(target_os = "macos") {
-                let _ = Command::new("security")
+                let out = Command::new("security")
                     .args([
                         "delete-generic-password",
                         "-s",
@@ -606,9 +751,24 @@ impl CredentialStore {
                         "-a",
                         connection_id,
                     ])
-                    .output();
+                    .output()
+                    .map_err(|e| {
+                        ConfigError::Keyring(format!("Keychain delete could not run: {e}"))
+                    })?;
+                // Exit 44 = entry did not exist; not an error.
+                if !out.status.success() && out.status.code() != Some(44) {
+                    let detail: String = String::from_utf8_lossy(&out.stderr)
+                        .trim()
+                        .chars()
+                        .take(200)
+                        .collect();
+                    return Err(ConfigError::Keyring(format!(
+                        "Keychain delete failed (exit {:?}): {detail}",
+                        out.status.code()
+                    )));
+                }
             } else {
-                let _ = Command::new("secret-tool")
+                let out = Command::new("secret-tool")
                     .args([
                         "clear",
                         "service",
@@ -616,7 +776,23 @@ impl CredentialStore {
                         "account",
                         connection_id,
                     ])
-                    .output();
+                    .output()
+                    .map_err(|e| {
+                        ConfigError::Keyring(format!("Secret service clear could not run: {e}"))
+                    })?;
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                    // secret-tool exits 1 when no entry matched; anything
+                    // else (or an explicit error message) is a failure.
+                    let not_found = out.status.code() == Some(1)
+                        && (stderr.is_empty() || stderr.contains("Cannot find"));
+                    if !not_found {
+                        let detail: String = stderr.trim().chars().take(200).collect();
+                        return Err(ConfigError::Keyring(format!(
+                            "Secret service clear failed: {detail}"
+                        )));
+                    }
+                }
             }
         }
         let mut guard = self.memory_vault.write().map_err(Self::lock_err)?;
@@ -820,8 +996,19 @@ impl SessionState {
 
     pub fn load_default() -> Option<Self> {
         let path = Self::default_config_path();
-        let raw = fs::read_to_string(path).ok()?;
-        Self::from_toml_str(&raw).ok()
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(_) => return None,
+        };
+        match Self::from_toml_str(&raw) {
+            Ok(sess) => Some(sess),
+            Err(_) => {
+                // Preserve the malformed session file (F-9) so a later save
+                // cannot overwrite the last readable state.
+                let _ = preserve_corrupt_config(&path);
+                None
+            }
+        }
     }
 
     pub fn save_default(&self) -> Result<(), ConfigError> {
@@ -1133,11 +1320,33 @@ impl AppPreferences {
     }
 
     pub fn load_default() -> Self {
+        Self::load_default_with_recovery().0
+    }
+
+    /// Loads preferences, preserving a malformed file exactly once instead
+    /// of silently replacing it with defaults (F-9).
+    pub fn load_default_with_recovery() -> (Self, Option<ConfigRecoveryNotice>) {
         let path = Self::default_config_path();
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|s| Self::from_toml_str(&s).ok())
-            .unwrap_or_default()
+        Self::load_from_file_with_recovery(path)
+    }
+
+    /// Path-parameterized variant of [`Self::load_default_with_recovery`].
+    pub fn load_from_file_with_recovery(
+        path: impl AsRef<Path>,
+    ) -> (Self, Option<ConfigRecoveryNotice>) {
+        let path = path.as_ref();
+        let notice = match fs::read_to_string(path) {
+            Ok(s) => match Self::from_toml_str(&s) {
+                Ok(prefs) => return (prefs, None),
+                Err(e) => preserve_corrupt_config(path).map(|backup| ConfigRecoveryNotice {
+                    file: path.to_path_buf(),
+                    backup,
+                    error: e.to_string(),
+                }),
+            },
+            Err(_) => None,
+        };
+        (Self::default(), notice)
     }
 
     pub fn save_default(&self) -> Result<(), ConfigError> {
@@ -1629,5 +1838,177 @@ sort_direction = "ascending"
         assert_eq!(cleared.default_open_with_for_ext("pdf"), None);
         cleared.set_default_open_with_for_ext("log", None);
         assert_eq!(cleared.default_open_with_for_ext("log"), None);
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    /// Serializes tests that mutate `PATH` (process-global state).
+    #[cfg(all(not(windows), target_os = "macos"))]
+    fn path_lock() -> std::sync::MutexGuard<'static, ()> {
+        static PATH_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        PATH_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Installs a fake `security` binary that ignores its arguments and
+    /// behaves per `body`, returning the temp dir guard.
+    #[cfg(all(not(windows), target_os = "macos"))]
+    fn install_fake_security(body: &str) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("security");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut combined = std::ffi::OsString::from(dir.path());
+        if let Some(old) = std::env::var_os("PATH") {
+            combined.push(":");
+            combined.push(&old);
+        }
+        std::env::set_var("PATH", combined);
+        dir
+    }
+
+    #[test]
+    fn corrupt_connections_file_is_preserved_with_notice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("connections.toml");
+        std::fs::write(&path, "not = valid = toml [[[").unwrap();
+
+        let (cfg, notice) = ConnectionsConfig::load_from_file_with_recovery(&path);
+        assert!(cfg.connections.is_empty(), "defaults must be active");
+        let notice = notice.expect("recovery notice expected for malformed file");
+        assert!(notice.error.contains("TOML") || !notice.error.is_empty());
+        assert!(!path.exists(), "malformed file must be moved away");
+        let backup_raw = std::fs::read_to_string(&notice.backup).unwrap();
+        assert_eq!(
+            backup_raw, "not = valid = toml [[[",
+            "original bytes must survive"
+        );
+        assert!(notice.backup.to_string_lossy().contains(".corrupt-"));
+    }
+
+    #[test]
+    fn corrupt_backup_is_not_duplicated_for_identical_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("connections.toml");
+        std::fs::write(&path, "garbage [[[".as_bytes()).unwrap();
+
+        let (_, first) = ConnectionsConfig::load_from_file_with_recovery(&path);
+        let first = first.unwrap();
+        // Simulate the next start: the same malformed content reappears.
+        std::fs::write(&path, "garbage [[[".as_bytes()).unwrap();
+        let (_, second) = ConnectionsConfig::load_from_file_with_recovery(&path);
+        let second = second.unwrap();
+
+        assert_eq!(
+            first.backup, second.backup,
+            "no second backup for identical content"
+        );
+        let backups: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .collect();
+        assert_eq!(backups.len(), 1, "exactly one backup must exist");
+        assert!(
+            !path.exists(),
+            "duplicate must be removed so defaults can be saved"
+        );
+    }
+
+    #[test]
+    fn empty_or_missing_file_yields_defaults_without_notice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("connections.toml");
+        let (_, notice) = ConnectionsConfig::load_from_file_with_recovery(&path);
+        assert!(notice.is_none(), "missing file is not a corruption");
+        std::fs::write(&path, "").unwrap();
+        let (_, notice) = ConnectionsConfig::load_from_file_with_recovery(&path);
+        assert!(notice.is_none(), "empty file is not a corruption");
+    }
+
+    #[test]
+    fn valid_file_loads_without_notice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("connections.toml");
+        std::fs::write(
+            &path,
+            "[[connections]]\nid = \"p1\"\nname = \"Profile\"\nprotocol = \"sftp\"\n",
+        )
+        .unwrap();
+        let (loaded, notice) = ConnectionsConfig::load_from_file_with_recovery(&path);
+        assert!(notice.is_none());
+        assert_eq!(loaded.connections.len(), 1);
+    }
+
+    #[cfg(all(not(windows), target_os = "macos"))]
+    #[test]
+    fn keychain_lookup_error_is_not_swallowed() {
+        let _guard = path_lock();
+        // "no such entry" (exit 44) stays Ok(None)...
+        let dir = install_fake_security("exit 44");
+        let store = CredentialStore::with_os_backend();
+        assert_eq!(store.get_secret("missing-entry-1").unwrap(), None);
+        drop(dir);
+
+        // ...but a real backend failure (locked keychain) becomes an error.
+        let dir = install_fake_security(
+            "echo 'keychain is locked' >&2\necho 'another error' >&2\nexit 1",
+        );
+        let store = CredentialStore::with_os_backend();
+        let err = store
+            .get_secret("locked-entry-1")
+            .expect_err("backend failure must surface");
+        assert!(matches!(err, ConfigError::Keyring(_)), "got: {err}");
+        assert!(err.to_string().contains("locked"), "got: {err}");
+        drop(dir);
+    }
+
+    #[cfg(all(not(windows), target_os = "macos"))]
+    #[test]
+    fn keychain_write_reports_rejected_secret() {
+        let _guard = path_lock();
+        // `security -i` exits 0 but prints an error line: must be Err.
+        let dir = install_fake_security(
+            "cat >/dev/null\necho 'Error: unable to locate a default keychain'\nexit 0",
+        );
+        let store = CredentialStore::with_os_backend();
+        let err = store
+            .set_secret("rejected-write-1", "s3cret")
+            .expect_err("stdout error line must surface");
+        assert!(err.to_string().contains("default keychain"), "got: {err}");
+        drop(dir);
+
+        // A successful write stays Ok and updates the memory vault.
+        let dir = install_fake_security("cat >/dev/null\nexit 0");
+        let store = CredentialStore::with_os_backend();
+        store.set_secret("ok-write-1", "hunter2").unwrap();
+        assert_eq!(
+            store.get_secret("ok-write-1").unwrap().as_deref(),
+            Some("hunter2")
+        );
+        drop(dir);
+    }
+
+    #[cfg(all(not(windows), target_os = "macos"))]
+    #[test]
+    fn keychain_delete_is_idempotent_and_reports_real_failures() {
+        let _guard = path_lock();
+        // Exit 44 = entry did not exist: idempotent success.
+        let dir = install_fake_security("exit 44");
+        let store = CredentialStore::with_os_backend();
+        store.delete_secret("absent-entry-1").unwrap();
+        drop(dir);
+
+        // Any other failure must be reported.
+        let dir = install_fake_security("echo 'access denied' >&2\nexit 1");
+        let store = CredentialStore::with_os_backend();
+        let err = store
+            .delete_secret("denied-entry-1")
+            .expect_err("delete failure must surface");
+        assert!(err.to_string().contains("access denied"), "got: {err}");
+        drop(dir);
     }
 }

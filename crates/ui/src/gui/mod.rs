@@ -419,6 +419,8 @@ struct GuiRuntime {
     watch_cycle_count: u32,
     terminal_drawer_open: bool,
     session_save_tx: mpsc::Sender<SessionState>,
+    /// Malformed-config recovery reports shown once at startup (F-9).
+    recovery_notices: Vec<String>,
     open_with_all_apps: Vec<OpenWithAppSlint>,
     fs_poll_tick: u32,
     staging_poll_tick: u32,
@@ -436,8 +438,16 @@ struct GuiRuntime {
 
 impl GuiRuntime {
     fn new(mut app_state: ManifoldAppState) -> Self {
-        let saved_connections = ConnectionsConfig::load_default();
-        let prefs = AppPreferences::load_default();
+        let (saved_connections, conn_recovery) = ConnectionsConfig::load_default_with_recovery();
+        let (prefs, prefs_recovery) = AppPreferences::load_default_with_recovery();
+        let mut recovery_notices = Vec::new();
+        for notice in [conn_recovery, prefs_recovery].into_iter().flatten() {
+            recovery_notices.push(format!(
+                "{} was malformed and could not be loaded. It was preserved at {}; defaults are active for this session.",
+                notice.file.display(),
+                notice.backup.display()
+            ));
+        }
         let mut sidebar_colors = HashMap::new();
         for prof in &saved_connections.connections {
             if prof.color_label != ColorLabel::None {
@@ -629,6 +639,7 @@ impl GuiRuntime {
             saved_connections,
             prefs,
             credential_store,
+            recovery_notices,
             worker_tx,
             worker_rx,
             bg_tasks_in_flight: 0,
@@ -1257,12 +1268,12 @@ impl GuiRuntime {
             } else {
                 None
             };
-            let secret = self
+            let backend_secret = self
                 .remote_backends
                 .get(prefix)
                 .or_else(|| self.remote_backends.get(clean_pref))
-                .and_then(|b| b.secret().map(str::to_string))
-                .or_else(|| self.credential_store.get_secret(&prof.id).ok().flatten());
+                .and_then(|b| b.secret().map(str::to_string));
+            let secret = backend_secret.or_else(|| self.get_secret_logged(&prof.id));
             return Some(RemoteSshSpec {
                 conn_name: prof.name,
                 host,
@@ -1876,6 +1887,20 @@ impl GuiRuntime {
             .push(format!("[TRANSFER] Cancelled task {task_id}"));
     }
 
+    /// Reads a stored secret and logs keyring failures instead of pretending
+    /// the credential simply does not exist (F-10).
+    fn get_secret_logged(&mut self, id: &str) -> Option<String> {
+        match self.credential_store.get_secret(id) {
+            Ok(secret) => secret,
+            Err(err) => {
+                self.logs.push(format!(
+                    "[KEYRING_ERR] Could not read credential for {id}: {err}"
+                ));
+                None
+            }
+        }
+    }
+
     fn show_toast(&mut self, kind: &str, message: impl Into<String>) {
         let msg = message.into();
         let is_err = kind == "error";
@@ -2342,7 +2367,7 @@ impl GuiRuntime {
             .find(|p| profile_to_vfs_url(p).starts_with(prefix))
             .cloned();
         if let Some(profile) = found_profile {
-            let secret = self.credential_store.get_secret(&profile.id).ok().flatten();
+            let secret = self.get_secret_logged(&profile.id);
             match RemoteVfsBackend::connect_live(profile, secret) {
                 Ok(remote) => {
                     let msg = format!("[CONNECT] Session opened for {prefix}");
@@ -5502,6 +5527,17 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
     let window = ManifoldWindow::new().map_err(|e| e.to_string())?;
     window.set_app_version_label(current_app_version_label().into());
     let rt = Rc::new(RefCell::new(GuiRuntime::new(initial_state)));
+    // Surface malformed-config recovery notices once at startup (F-9).
+    {
+        let notices = rt.borrow().recovery_notices.clone();
+        if !notices.is_empty() {
+            let mut guard = rt.borrow_mut();
+            for n in notices {
+                guard.logs.push(format!("[CONFIG_RECOVERY] {n}"));
+                guard.show_toast("error", n);
+            }
+        }
+    }
     // Complete or roll back interrupted two-step directory swaps in the
     // restored pane directories (F-35).
     {
@@ -6083,7 +6119,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                         .find(|p| p.id == item_id)
                         .cloned();
                     if let Some(prof) = prof_opt {
-                        populate_connect_modal_from_profile(&w, &guard, &prof);
+                        populate_connect_modal_from_profile(&w, &mut guard, &prof);
                         w.set_show_connect_modal(true);
                     } else if sec_name == "Connections" && split_remote_uri(&target_path).is_some()
                     {
@@ -6099,7 +6135,7 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
                             }
                             fallback.base_path = rel;
                         }
-                        populate_connect_modal_from_profile(&w, &guard, &fallback);
+                        populate_connect_modal_from_profile(&w, &mut guard, &fallback);
                         w.set_show_connect_modal(true);
                     } else {
                         let title = format!("Edit Label for \"{item_label}\"");
@@ -9389,15 +9425,19 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             let secret_opt = if !secret.is_empty() {
                 Some(secret.clone())
             } else {
-                guard
-                    .credential_store
-                    .get_secret(&profile.id)
-                    .ok()
-                    .flatten()
+                guard.get_secret_logged(&profile.id)
             };
 
             if w.get_connect_save_credentials() && !secret.is_empty() {
-                let _ = guard.credential_store.set_secret(&profile.id, &secret);
+                if let Err(err) = guard.credential_store.set_secret(&profile.id, &secret) {
+                    // Never report a successful save when the OS keyring
+                    // rejected the write (F-10).
+                    guard.logs.push(format!("[KEYRING_ERR] {err}"));
+                    guard.show_toast(
+                        "error",
+                        format!("Could not store password in the system keyring: {err}"),
+                    );
+                }
             }
 
             if color == ColorLabel::None {
