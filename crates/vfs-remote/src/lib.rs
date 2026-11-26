@@ -114,6 +114,31 @@ fn try_batch_mode_first(cmd_vec: &[String]) -> Option<Result<Vec<u8>, VfsError>>
     })))
 }
 
+/// Parses `df -kP` (POSIX 1024-block) output into [`VolumeStats`] (F-15).
+/// Tolerates long device names (ZFS/AFS) by scanning for the numeric
+/// window `blocks used avail pct mount`.
+fn parse_df_kp(out: &str) -> Option<VolumeStats> {
+    for line in out.lines().rev() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 5 {
+            continue;
+        }
+        for i in 0..=(f.len() - 5) {
+            let blocks = f[i].parse::<u64>().ok();
+            let avail = f[i + 2].parse::<u64>().ok();
+            if let (Some(b), Some(a)) = (blocks, avail) {
+                if f[i + 3].ends_with('%') && b > 0 {
+                    return Some(VolumeStats {
+                        total_bytes: b * 1024,
+                        available_bytes: a * 1024,
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Validates SSH/SCP host, username, and optional key path against option injection (`SEC-01`).
 pub fn validate_ssh_endpoint(
     host: &str,
@@ -177,7 +202,7 @@ pub struct RemoteVfsBackend {
     live_mode: bool,
     connected: Arc<RwLock<bool>>,
     nodes: Arc<RwLock<HashMap<String, RemoteNode>>>,
-    volume_stats: VolumeStats,
+    volume_stats: Option<VolumeStats>,
 }
 
 impl RemoteVfsBackend {
@@ -244,7 +269,8 @@ impl RemoteVfsBackend {
             );
         }
 
-        // Default capacity matching `470,07 GB` in `doc/image1.png` (`Shares > Binarynights > Office`)
+        // Mock sessions (tests/demo) carry the reference capacity from
+        // `doc/image1.png`; live sessions probe the real server (F-15).
         let default_avail = 470_070_000_000u64;
         Ok(Self {
             profile,
@@ -253,10 +279,10 @@ impl RemoteVfsBackend {
             live_mode: false,
             connected: Arc::new(RwLock::new(true)),
             nodes: Arc::new(RwLock::new(map)),
-            volume_stats: VolumeStats {
+            volume_stats: Some(VolumeStats {
                 total_bytes: 500_000_000_000,
                 available_bytes: default_avail,
-            },
+            }),
         })
     }
 
@@ -282,7 +308,30 @@ impl RemoteVfsBackend {
             backend.list_directory("/")?;
             backend.profile.base_path = "/".to_string();
         }
+        // F-15: replace the mock capacity with real server values; when the
+        // server does not report them the UI hides the badge instead of
+        // showing invented numbers.
+        backend.volume_stats = backend.probe_volume_stats(&init_path);
         Ok(backend)
+    }
+
+    /// Queries real volume capacity where the protocol can report it
+    /// (SFTP via `df -kP`, WebDAV via quota PROPFIND). Returns `None` for
+    /// protocols without a meaningful capacity concept (F-15).
+    fn probe_volume_stats(&mut self, path: &str) -> Option<VolumeStats> {
+        match self.profile.protocol {
+            ProtocolType::Sftp => {
+                let esc = path.replace('\'', "'\\''");
+                let out = self
+                    .run_remote_shell(&format!("LC_ALL=C df -kP -- '{esc}' 2>/dev/null"))
+                    .ok()?;
+                parse_df_kp(&out)
+            }
+            ProtocolType::WebDav => {
+                protocols::webdav_volume_stats(&self.profile, self.secret.as_deref(), path)
+            }
+            _ => None,
+        }
     }
 
     /// Returns the optional secret (password or passphrase) held for this remote session.
@@ -918,7 +967,14 @@ impl FileSystemBackend for RemoteVfsBackend {
 
     fn volume_stats(&self, _path: &str) -> Result<VolumeStats, VfsError> {
         self.ensure_connected()?;
-        Ok(self.volume_stats)
+        // F-15: never invent capacity. Live sessions report what the server
+        // actually returned; unknown capacities surface as an error and the
+        // UI omits the badge.
+        self.volume_stats.ok_or_else(|| {
+            VfsError::UnsupportedOperation(
+                "The remote server does not report volume capacity".to_string(),
+            )
+        })
     }
 
     fn create_dir(&self, path: &str) -> Result<(), VfsError> {
@@ -2227,5 +2283,24 @@ mod tests {
             .expect("must report")
             .expect_err("command failure must surface");
         assert!(err.to_string().contains("boom"), "got: {err}");
+    }
+
+    #[test]
+    fn df_kp_parsing_reports_real_capacity() {
+        // F-15: real `df -kP` values, not the invented 500 GB.
+        let out = "Filesystem     1024-blocks      Used Available Capacity Mounted on\n\
+                   /dev/disk2s1   965526776 428138832 537387944    45% /System/Volumes/Data\n\
+                   server:/share  488245248  12000000 476245248     3% /mnt/share\n";
+        let stats = parse_df_kp(out).unwrap();
+        assert_eq!(stats.total_bytes, 488245248 * 1024);
+        assert_eq!(stats.available_bytes, 476245248 * 1024);
+
+        // Long device names (ZFS) must not shift the numeric window.
+        let zfs = "pool/nested/dataset 1073741824 1000 1073740000   1% /pool\n";
+        let stats = parse_df_kp(zfs).unwrap();
+        assert_eq!(stats.total_bytes, 1073741824 * 1024);
+
+        assert!(parse_df_kp("df: no such command").is_none());
+        assert!(parse_df_kp("").is_none());
     }
 }

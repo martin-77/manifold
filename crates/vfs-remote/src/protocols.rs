@@ -13,7 +13,7 @@ use std::time::SystemTime;
 use manifold_config::{ConnectionProfile, ProtocolType};
 use manifold_vfs::{
     create_secure_temp_file, infer_file_kind, system_time_to_utc_civil, ColorLabel, FileMetadata,
-    VfsError,
+    VfsError, VolumeStats,
 };
 use sha2::{Digest, Sha256};
 
@@ -941,6 +941,42 @@ pub fn webdav_remove(
     Ok(())
 }
 
+/// Queries WebDAV quota via PROPFIND of the RFC 4918 properties
+/// `quota-available-bytes` / `quota-used-bytes` (F-15). Returns `None`
+/// when the server does not expose quota information.
+pub fn webdav_volume_stats(
+    profile: &ConnectionProfile,
+    secret: Option<&str>,
+    norm_path: &str,
+) -> Option<VolumeStats> {
+    let url = resolve_webdav_url(profile, norm_path).ok()?;
+    let mut cfg = webdav_auth_config(profile, secret, &url);
+    cfg.push("header = \"Depth: 0\"".to_string());
+    cfg.push("header = \"Content-Type: application/xml; charset=utf-8\"".to_string());
+    let body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
+                <d:propfind xmlns:d=\"DAV:\"><d:prop>\
+                <d:quota-available-bytes/><d:quota-used-bytes/>\
+                </d:prop></d:propfind>";
+    let xml_bytes =
+        run_curl_with_stdin_config(&cfg, &["-X", "PROPFIND", "--data-binary", body]).ok()?;
+    let xml = String::from_utf8_lossy(&xml_bytes);
+    let avail = extract_xml_tag_text_ns(&xml, "quota-available-bytes")?
+        .trim()
+        .parse::<i64>()
+        .ok()?;
+    let used = extract_xml_tag_text_ns(&xml, "quota-used-bytes")
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    // Negative values mean "unlimited/unknown" per RFC 4918.
+    if avail < 0 {
+        return None;
+    }
+    Some(VolumeStats {
+        total_bytes: avail.max(0) as u64 + used.max(0) as u64,
+        available_bytes: avail as u64,
+    })
+}
+
 pub fn webdav_move_or_copy(
     profile: &ConnectionProfile,
     secret: Option<&str>,
@@ -1866,6 +1902,32 @@ printf '<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>'"#
             "GCS must route to the interoperability endpoint, got: {logged}"
         );
         std::env::remove_var("MANIFOLD_URL_LOG");
+        drop(dir);
+    }
+
+    #[test]
+    fn webdav_quota_propfind_reports_real_capacity() {
+        let _guard = curl_path_lock();
+        let dir = install_fake_curl(
+            r#"printf '<D:multistatus xmlns:D="DAV:"><D:response><D:propstat><D:prop><D:quota-available-bytes>300</D:quota-available-bytes><D:quota-used-bytes>100</D:quota-used-bytes></D:prop></D:propstat></D:response></D:multistatus>'"#,
+        );
+        let stats = webdav_volume_stats(&s3_profile(), Some("s"), "/").expect("quota reported");
+        assert_eq!(stats.available_bytes, 300);
+        assert_eq!(stats.total_bytes, 400);
+        drop(dir);
+
+        // Unlimited/unknown quota (-1/-2) must yield None, not fake numbers.
+        let dir = install_fake_curl(
+            r#"printf '<D:multistatus xmlns:D="DAV:"><D:response><D:propstat><D:prop><D:quota-available-bytes>-3</D:quota-available-bytes><D:quota-used-bytes>100</D:quota-used-bytes></D:prop></D:propstat></D:response></D:multistatus>'"#,
+        );
+        assert!(webdav_volume_stats(&s3_profile(), Some("s"), "/").is_none());
+        drop(dir);
+
+        // No quota properties at all: None.
+        let dir = install_fake_curl(
+            r#"printf '<D:multistatus xmlns:D="DAV:"><D:response><D:propstat><D:prop></D:prop></D:propstat></D:response></D:multistatus>'"#,
+        );
+        assert!(webdav_volume_stats(&s3_profile(), Some("s"), "/").is_none());
         drop(dir);
     }
 
