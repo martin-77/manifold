@@ -1,8 +1,17 @@
 //! Native macOS integrations via the Objective-C runtime: Finder-aware
 //! Trash (`NSFileManager trashItemAtURL`, F-7) and file clipboard through
 //! `NSPasteboard` (F-26). Both replace the previous AppleScript/manual-copy
-//! workarounds and degrade gracefully to the legacy paths when the runtime
-//! calls fail (e.g. headless contexts).
+//! workarounds. A failed Trash call is surfaced to the user (R07/R08:
+//! with the real `NSError` description) and must never degrade to the
+//! less-safe manual move; the pasteboard helpers report failure so the
+//! caller can fall back to the legacy path.
+//!
+//! The runtime is driven by a small hand-rolled FFI (kept over a crate
+//! dependency by the Round-1 decision to prefer native macOS APIs). R08
+//! hardened it: every synchronous entry point runs inside an explicit
+//! `@autoreleasepool` (worker threads have no run-loop pool), `BOOL` is
+//! modelled as `c_schar` (x86_64 semantics, not Rust `bool`), and owned
+//! references follow the +1/+0 conventions (F-27).
 
 #![cfg(target_os = "macos")]
 
@@ -13,11 +22,37 @@ extern "C" {
     fn objc_getClass(name: *const std::ffi::c_char) -> *mut c_void;
     fn sel_registerName(name: *const std::ffi::c_char) -> *mut c_void;
     fn objc_msgSend();
+    fn objc_autoreleasePoolPush() -> *mut c_void;
+    fn objc_autoreleasePoolPop(ptr: *mut c_void);
+}
+
+/// R08: RAII `@autoreleasepool` for the synchronous FFI entry points.
+/// Every `NSString`/`NSURL`/`NSArray` this module creates is autoreleased;
+/// trash and pasteboard operations run on long-lived GUI worker threads
+/// that have no run-loop pool, so without an explicit pool those objects
+/// accumulate for the lifetime of the process. All Rust-side copies are
+/// made before the guard drops, so popping early is safe.
+struct AutoreleaseGuard(*mut c_void);
+
+impl AutoreleaseGuard {
+    unsafe fn new() -> Self {
+        Self(objc_autoreleasePoolPush())
+    }
+}
+
+impl Drop for AutoreleaseGuard {
+    fn drop(&mut self) {
+        unsafe { objc_autoreleasePoolPop(self.0) };
+    }
 }
 
 type Msg0 = unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void;
 type Msg1 = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
-type Msg1Bool = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> bool;
+/// R08: Objective-C `BOOL` is a signed char on x86_64 (only arm64 maps it
+/// to a real C `bool`); reading it as Rust `bool` is UB for non-0/1
+/// values, so every boolean message send goes through `c_schar`.
+type ObjcBool = std::ffi::c_schar;
+type Msg1Bool = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> ObjcBool;
 type Msg2 = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> *mut c_void;
 type MsgCount = unsafe extern "C" fn(*mut c_void, *mut c_void) -> usize;
 type MsgIdx = unsafe extern "C" fn(*mut c_void, *mut c_void, usize) -> *mut c_void;
@@ -43,7 +78,8 @@ unsafe fn msg1_bool(recv: *mut c_void, sel_name: &std::ffi::CStr, a: *mut c_void
         return false;
     }
     let f: Msg1Bool = std::mem::transmute(objc_msgSend as *const ());
-    f(recv, sel_registerName(sel_name.as_ptr()), a)
+    let raw = f(recv, sel_registerName(sel_name.as_ptr()), a);
+    raw != 0
 }
 
 unsafe fn msg2(
@@ -112,8 +148,10 @@ unsafe fn ns_array_from_pointers(items: &[*mut c_void]) -> Option<*mut c_void> {
 /// which records the Finder Put-Back metadata the manual rename to
 /// `~/.Trash` never could (F-7). Returns the final Trash path on success;
 /// `Err` is surfaced to the user — the caller must NOT degrade to the
-/// less-safe manual move (R07).
+/// less-safe manual move (R07). The `Err` carries the real `NSError`
+/// description (R08) so users see why Finder refused.
 pub(super) fn macos_trash_item(path: &str) -> Result<String, String> {
+    let _pool = unsafe { AutoreleaseGuard::new() };
     unsafe {
         let fm_cls = objc_getClass(c"NSFileManager".as_ptr());
         if fm_cls.is_null() {
@@ -125,22 +163,34 @@ pub(super) fn macos_trash_item(path: &str) -> Result<String, String> {
         // out-parameter receives the new NSURL inside the Trash, whose
         // metadata carries the Finder Put-Back information (F-7).
         let mut resulting_url: *mut c_void = std::ptr::null_mut();
+        let mut error: *mut c_void = std::ptr::null_mut();
         let f: unsafe extern "C" fn(
             *mut c_void,
             *mut c_void,
             *mut c_void,
             *mut *mut c_void,
             *mut *mut c_void,
-        ) -> bool = std::mem::transmute(objc_msgSend as *const ());
+        ) -> ObjcBool = std::mem::transmute(objc_msgSend as *const ());
         let ok = f(
             fm,
             sel_registerName(c"trashItemAtURL:resultingItemURL:error:".as_ptr()),
             url,
             &mut resulting_url,
-            std::ptr::null_mut(),
-        );
+            &mut error,
+        ) != 0;
         if !ok {
-            return Err("NSFileManager rejected the trash request".to_string());
+            // R08: surface the NSError's localizedDescription instead of
+            // the bare "rejected" so the refusal reason (permissions,
+            // read-only volume, …) reaches the user.
+            let reason = if error.is_null() {
+                "no error details".to_string()
+            } else {
+                let desc = msg0(error, c"localizedDescription");
+                str_from_ns_string(desc).unwrap_or_else(|| "no error details".to_string())
+            };
+            return Err(format!(
+                "NSFileManager rejected the trash request: {reason}"
+            ));
         }
         let moved_path = msg0(resulting_url, c"path");
         match str_from_ns_string(moved_path) {
@@ -163,6 +213,7 @@ fn path_fallback_name(path: &str) -> String {
 /// supports multiple files and never round-trips through Apple Events.
 /// Returns false when the native paste failed so callers can fall back.
 pub(super) fn macos_pasteboard_write_file_urls(paths: &[&str]) -> bool {
+    let _pool = unsafe { AutoreleaseGuard::new() };
     unsafe {
         let pb_cls = objc_getClass(c"NSPasteboard".as_ptr());
         if pb_cls.is_null() {
@@ -193,6 +244,7 @@ pub(super) fn macos_pasteboard_write_file_urls(paths: &[&str]) -> bool {
 /// empty vector when the pasteboard holds no file URLs. `None` signals a
 /// native failure so callers can fall back to the legacy path.
 pub(super) fn macos_pasteboard_read_file_urls() -> Option<Vec<String>> {
+    let _pool = unsafe { AutoreleaseGuard::new() };
     unsafe {
         let pb_cls = objc_getClass(c"NSPasteboard".as_ptr());
         if pb_cls.is_null() {
@@ -266,6 +318,20 @@ mod tests {
         assert!(
             read.contains(&b.to_string_lossy().to_string()),
             "roundtrip lost multi-file entry: {read:?}"
+        );
+    }
+
+    /// R08: a refused trash must carry the real NSError description,
+    /// not just the bare "rejected" string. Uses a missing path, which
+    /// never touches user session state.
+    #[test]
+    fn trash_failure_surfaces_nserror_reason() {
+        let missing = "/tmp/manifold-r08-definitely-missing-file.txt";
+        let _ = std::fs::remove_file(missing);
+        let err = macos_trash_item(missing).expect_err("trashing a missing file must fail");
+        assert!(
+            err.contains("rejected the trash request:"),
+            "error must carry the NSError reason, got: {err}"
         );
     }
 

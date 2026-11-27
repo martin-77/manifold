@@ -554,7 +554,9 @@ extern "C" {
         name: *mut std::ffi::c_void,
         imp: *const std::ffi::c_void,
         types: *const std::ffi::c_char,
-    ) -> bool;
+        // R08: ObjC BOOL is signed char on x86_64; never model it as Rust
+        // bool (UB for non-0/1 returns).
+    ) -> std::ffi::c_schar;
     fn objc_registerClassPair(cls: *mut std::ffi::c_void);
 }
 
