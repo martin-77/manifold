@@ -4,6 +4,25 @@
 //! (S3, Google Drive, GCS, Azure Blob), FTP/FTPS, WebDAV, and SMB shares, plus the
 //! Remote Edit-in-Place staging manager (`$XDG_CACHE_HOME/manifold/staging/<session_id>/<filename>`)
 //! and SSH Terminal command builder.
+//!
+//! ## SFTP architecture (N01)
+//!
+//! The SFTP backend is implemented on top of the OpenSSH CLI (`ssh`/`scp`):
+//! transport, SSH-Agent, `~/.ssh/config`, ProxyJump and host-key verification
+//! are inherited from the local OpenSSH installation. Directory operations are
+//! machine-generated POSIX shell scripts executed remotely. Since N01 those
+//! scripts run through [`wrap_posix_shell_command`] (base64 → `sh`), so the
+//! remote account's LOGIN shell may be any of Fish, Bash, Zsh or POSIX sh
+//! without breaking them; the interactive embedded terminal likewise execs
+//! `$SHELL` from inside the wrapped POSIX script, keeping the user's own
+//! shell interactive.
+//!
+//! Known limitation (documented per N01 scope): this is still shell execution,
+//! not the native SFTP subsystem. Servers that forbid shell command execution
+//! (sftp-only chroot, `rssh`, forced commands) cannot be used for browsing;
+//! genuine SFTP-protocol support (RFC draft-ietf-secsh-filexfr) would replace
+//! the `ls`-parsing layer and is tracked as future work — it must preserve
+//! the OpenSSH transport guarantees listed above.
 
 pub mod protocols;
 
@@ -224,6 +243,51 @@ impl Drop for HelperGuard {
     }
 }
 
+/// N01: standard-alphabet base64 with padding. Hand-rolled to avoid a
+/// new dependency (R15 keeps the tree dependency-minimal); the test
+/// suite verifies it byte-for-byte against the system `base64` CLI.
+fn b64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let mut b = [0u8; 3];
+        b[..chunk.len()].copy_from_slice(chunk);
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        let mut four = [
+            T[(n >> 18) as usize & 63],
+            T[(n >> 12) as usize & 63],
+            T[(n >> 6) as usize & 63],
+            T[n as usize & 63],
+        ];
+        if chunk.len() == 1 {
+            four[2] = b'=';
+            four[3] = b'=';
+        } else if chunk.len() == 2 {
+            four[3] = b'=';
+        }
+        // The base64 alphabet is ASCII by construction.
+        out.push_str(std::str::from_utf8(&four).unwrap_or_default());
+    }
+    out
+}
+
+/// N01: wraps a POSIX `sh` script so it runs under a real POSIX shell
+/// regardless of the remote account's LOGIN shell. Fish (and csh/tcsh)
+/// choke on `for …; do … done`, `${VAR:-x}`, `(...)` subshells and the
+/// POSIX `'\''` escape, which broke SFTP listings and the embedded
+/// terminal on Fish servers.
+///
+/// The outer pipeline consists solely of `[A-Za-z0-9+/=| ]` characters
+/// (base64 alphabet plus `echo `, ` | base64 -d | sh`), so it parses
+/// identically in Fish, Bash, Zsh and POSIX sh — no re-quoting happens
+/// anywhere, which also closes the injection surface: the script bytes
+/// never reach the login shell's parser. `base64 -d` decodes on GNU,
+/// BusyBox and BSD/macOS coreutils alike; backends that lack it fall
+/// back to the legacy raw form via [`RemoteVfsBackend::shell_supports_b64_wrap`].
+pub fn wrap_posix_shell_command(script: &str) -> String {
+    format!("echo {} | base64 -d | sh", b64_encode(script.as_bytes()))
+}
+
 /// Parses `df -kP` (POSIX 1024-block) output into [`VolumeStats`] (F-15).
 /// Tolerates long device names (ZFS/AFS) by scanning for the numeric
 /// window `blocks used avail pct mount`.
@@ -313,6 +377,9 @@ pub struct RemoteVfsBackend {
     connected: Arc<RwLock<bool>>,
     nodes: Arc<RwLock<HashMap<String, RemoteNode>>>,
     volume_stats: Option<VolumeStats>,
+    /// N01: caches whether the server can run the base64 POSIX wrapper
+    /// (1 = wrapped mode, 0 = legacy raw mode). Probed once per session.
+    b64_mode: Arc<std::sync::OnceLock<u8>>,
 }
 
 impl RemoteVfsBackend {
@@ -393,6 +460,7 @@ impl RemoteVfsBackend {
                 total_bytes: 500_000_000_000,
                 available_bytes: default_avail,
             }),
+            b64_mode: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -576,17 +644,63 @@ impl RemoteVfsBackend {
         self.exec_pty_cmd_with_sentinel(cmd_vec, timeout_sec, "")
     }
 
-    fn run_remote_shell(&self, remote_sh: &str) -> Result<String, VfsError> {
+    /// N01: one probe per session decides whether the server can execute
+    /// the base64 POSIX wrapper. The probe command itself is login-shell
+    /// agnostic (single-quoted payload, plain pipeline), so it runs even
+    /// under Fish; a server without `base64`/`sh` fails it and the
+    /// backend keeps using the legacy raw form (which requires a
+    /// POSIX-compatible login shell).
+    fn shell_supports_b64_wrap(&self) -> bool {
+        *self.b64_mode.get_or_init(|| {
+            let seq = SSH_SENTINEL_SEQ.fetch_add(1, Ordering::Relaxed);
+            let sentinel = format!("__MANIFOLD_B64PROBE_{}_{seq}__", std::process::id());
+            // `printf d30=` decodes to "w" — a 1-byte round trip through
+            // the exact pipeline the wrapper uses.
+            let probe = format!("printf '{sentinel}\\n'; printf d30= | base64 -d 2>/dev/null");
+            match self.run_remote_cmd_vec(&probe, &sentinel) {
+                Ok(raw) => {
+                    let text = String::from_utf8_lossy(&raw).replace("\r\n", "\n");
+                    let body = text
+                        .split_once(&format!("{sentinel}\n"))
+                        .map(|(_, b)| b)
+                        .unwrap_or("");
+                    if body.trim_end() == "w" {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                Err(_) => 0,
+            }
+        }) == 1
+    }
+
+    /// Builds `ssh <base> -- <target> <remote_cmd>` and runs it through
+    /// the auth-aware executor (BatchMode → askpass → PTY, F-33/R12).
+    fn run_remote_cmd_vec(&self, remote_cmd: &str, sentinel: &str) -> Result<Vec<u8>, VfsError> {
         let (base_args, target) = self.ssh_base_args(false)?;
-        let seq = SSH_SENTINEL_SEQ.fetch_add(1, Ordering::Relaxed);
-        let sentinel = format!("__MANIFOLD_BEGIN_{}_{seq}__", std::process::id());
         let mut cmd_vec = vec!["ssh".to_string()];
         cmd_vec.extend(base_args);
         cmd_vec.push("--".to_string());
         cmd_vec.push(target);
-        let wrapped = format!("printf '{sentinel}\\n'; {remote_sh}");
-        cmd_vec.push(wrapped);
-        let raw = self.exec_pty_cmd_with_sentinel(&cmd_vec, "30.0", &sentinel)?;
+        cmd_vec.push(remote_cmd.to_string());
+        self.exec_pty_cmd_with_sentinel(&cmd_vec, "30.0", sentinel)
+    }
+
+    fn run_remote_shell(&self, remote_sh: &str) -> Result<String, VfsError> {
+        let seq = SSH_SENTINEL_SEQ.fetch_add(1, Ordering::Relaxed);
+        let sentinel = format!("__MANIFOLD_BEGIN_{}_{seq}__", std::process::id());
+        // N01: the sentinel printf is part of the POSIX script. In
+        // wrapped mode the login shell only ever sees the base64
+        // pipeline; in legacy mode the script goes to it directly
+        // (works for POSIX login shells, as before N01).
+        let script = format!("printf '{sentinel}\\n'; {remote_sh}");
+        let remote_cmd = if self.shell_supports_b64_wrap() {
+            wrap_posix_shell_command(&script)
+        } else {
+            script
+        };
+        let raw = self.run_remote_cmd_vec(&remote_cmd, &sentinel)?;
         let text = String::from_utf8_lossy(&raw).replace("\r\n", "\n");
         let marker = format!("{sentinel}\n");
         if let Some((_, body)) = text.split_once(&marker) {
@@ -2296,8 +2410,11 @@ impl TerminalIntegration {
         })
     }
 
-    /// Builds the SSH command for a remote SFTP connection profile (`Section 3.8` of `BRIEF.md`):
-    /// `ssh -p {port} [-i {key}] -t -- {user}@{host} "cd '{remote_path}'; exec $SHELL -l"`
+    /// Builds the SSH command for the embedded remote terminal
+    /// (`Section 3.8` of `BRIEF.md`). N01: the `cd` + `exec $SHELL -l`
+    /// script is base64-wrapped so a Fish/csh login shell only sees a
+    /// shell-safe pipeline; the user's real login shell stays
+    /// interactive (`-t` allocates the TTY).
     pub fn build_remote_ssh_terminal(
         profile: &ConnectionProfile,
         remote_path: &str,
@@ -2325,7 +2442,13 @@ impl TerminalIntegration {
         args.push("-t".to_string());
         args.push("--".to_string());
         args.push(format!("{user}@{host}"));
-        args.push(format!("cd '{safe_remote_path}'; exec $SHELL -l"));
+        // N01: the cd + exec script is POSIX and runs under the wrapped
+        // `sh`; the login shell only sees the base64 pipeline. The
+        // user's real login shell ($SHELL, set by sshd) is exec'd
+        // interactively afterwards — Fish users keep interactive Fish.
+        let script =
+            format!("cd '{safe_remote_path}' 2>/dev/null; exec \"${{SHELL:-/bin/sh}}\" -l");
+        args.push(wrap_posix_shell_command(&script));
 
         Ok(TerminalCommandSpec {
             program: "ssh".to_string(),
@@ -2375,19 +2498,49 @@ mod tests {
         let cmd =
             TerminalIntegration::build_remote_ssh_terminal(&profile, "/var/www/html").unwrap();
         assert_eq!(cmd.program, "ssh");
-        assert_eq!(
-            cmd.args,
-            vec![
-                "-p",
-                "22",
-                "-i",
-                "~/.ssh/id_ed25519",
-                "-t",
-                "--",
-                "admin@johnappleseed.com",
-                "cd '/var/www/html'; exec $SHELL -l"
-            ]
+        let last = cmd.args.last().expect("remote command present");
+        // N01: the outer command is only the shell-safe base64 pipeline;
+        // no POSIX syntax reaches the login shell's parser.
+        assert!(
+            last.starts_with("echo ") && last.ends_with("| base64 -d | sh"),
+            "outer command must be the base64 wrapper: {last}"
         );
+        assert!(
+            !last.contains(';') && !last.contains('\'') && !last.contains('$'),
+            "raw POSIX script leaked into the outer command: {last}"
+        );
+        #[cfg(unix)]
+        {
+            let b64 = last
+                .trim_start_matches("echo ")
+                .trim_end_matches(" | base64 -d | sh");
+            let decoded = manifold_posix_decode(b64);
+            assert_eq!(
+                decoded,
+                "cd '/var/www/html' 2>/dev/null; exec \"${SHELL:-/bin/sh}\" -l"
+            );
+        }
+    }
+
+    /// N01: decodes a base64 payload with the system `base64 -d`,
+    /// exactly as the remote `sh` pipeline would.
+    #[cfg(unix)]
+    fn manifold_posix_decode(b64: &str) -> String {
+        use std::io::Write;
+        let mut child = std::process::Command::new("base64")
+            .arg("-d")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b64.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        String::from_utf8(out.stdout).unwrap()
     }
 
     #[test]
@@ -2899,5 +3052,173 @@ mod tests {
 
         assert!(parse_df_kp("df: no such command").is_none());
         assert!(parse_df_kp("").is_none());
+    }
+
+    // ---- N01: non-POSIX login shell compatibility (base64 wrapper) ----
+
+    #[cfg(unix)]
+    fn decode_via_system_b64(input: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut child = std::process::Command::new("base64")
+            .arg("-d")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
+        child.wait_with_output().unwrap().stdout
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn b64_encode_matches_system_base64() {
+        let cases: Vec<Vec<u8>> = vec![
+            b"".to_vec(),
+            b"w".to_vec(),
+            b"hw".to_vec(),
+            b"hwl".to_vec(),
+            "ls -- 'a'b\\c ünïcode.txt\nfor f in *; do :; done"
+                .as_bytes()
+                .to_vec(),
+            (0..=255u8).collect(),
+        ];
+        for data in cases {
+            let enc = b64_encode(&data);
+            let sys = decode_via_system_b64(enc.as_bytes());
+            assert_eq!(sys, data, "round trip failed for {} bytes", data.len());
+            assert!(
+                enc.len().is_multiple_of(4),
+                "padded length expected, got {enc}"
+            );
+        }
+    }
+
+    /// The outer wrapper command must contain ONLY characters that Fish,
+    /// csh, Bash, Zsh and POSIX sh all parse identically (base64
+    /// alphabet + `echo `, ` | base64 -d | sh`): no quotes, semicolons,
+    /// dollar signs, backticks or backslashes may leak out of the script.
+    #[test]
+    fn wrapped_outer_command_is_shell_safe_charset() {
+        let nasty = "echo 'x'; `id`; $(id); ${VAR:-y}; \\\\ >|&<>";
+        let outer = wrap_posix_shell_command(nasty);
+        assert!(
+            outer
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+/-=".contains(c) || c == ' ' || c == '|'),
+            "outer command contains unsafe characters: {outer}"
+        );
+    }
+
+    /// Runs the production wrapper through the REAL local interpreters
+    /// (the same way sshd runs `$LOGIN_SHELL -c <outer>`), listing a
+    /// directory whose names carry spaces, quotes, backslashes, Unicode
+    /// and shell metacharacters.
+    #[cfg(unix)]
+    #[test]
+    fn wrapped_scripts_execute_under_bash_zsh_and_sh() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = [
+            "sp ace.txt",
+            "quo'te.txt",
+            "back\\slash.txt",
+            "ünïcode.txt",
+            "dollar$var.txt",
+            "semi;colon.txt",
+            "star_glob.txt",
+        ];
+        for n in names {
+            std::fs::write(dir.path().join(n), b"x").unwrap();
+        }
+        // Same escaping the SFTP backend uses for POSIX single quotes.
+        let esc = dir.path().display().to_string().replace('\'', "'\\''");
+        let script = format!("LC_ALL=C ls -1 -- '{esc}'");
+        let outer = wrap_posix_shell_command(&script);
+
+        let mut shells: Vec<&str> = vec!["/bin/sh", "/bin/bash", "/bin/zsh"];
+        let fish = which_fish();
+        if let Some(f) = &fish {
+            shells.push(f.as_str());
+        } else {
+            eprintln!("N01: fish not installed locally — skipped (outer charset test covers it)");
+        }
+        for sh in shells {
+            let out = std::process::Command::new(sh)
+                .arg("-c")
+                .arg(&outer)
+                .output()
+                .unwrap_or_else(|e| panic!("{sh}: {e}"));
+            assert!(
+                out.status.success(),
+                "{sh}: wrapper failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let listing = String::from_utf8_lossy(&out.stdout);
+            for n in names {
+                assert!(listing.contains(n), "{sh}: listing misses {n}: {listing}");
+            }
+        }
+    }
+
+    /// Non-zero exit codes must propagate through the wrapper to the
+    /// caller (failed listings may not look like empty directories).
+    #[cfg(unix)]
+    #[test]
+    fn wrapped_script_propagates_nonzero_exit() {
+        let outer = wrap_posix_shell_command("true; exit 7");
+        for sh in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
+            let status = std::process::Command::new(sh)
+                .arg("-c")
+                .arg(&outer)
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(7), "{sh} must propagate exit 7");
+        }
+    }
+
+    /// A path containing a POSIX injection payload must be listed
+    /// literally, not executed.
+    #[cfg(unix)]
+    #[test]
+    fn wrapped_script_blocks_shell_injection() {
+        let dir = tempfile::tempdir().unwrap();
+        // File name with an embedded POSIX injection payload (relative
+        // touch so the payload could only create a file inside `dir`).
+        let evil = "x'; touch PWNED; '";
+        std::fs::write(dir.path().join(evil), b"x").unwrap();
+        let esc = evil.replace('\'', "'\\''");
+        let script = format!(
+            "cd -- '{}' 2>/dev/null && ls -1 -- '{esc}'",
+            dir.path().display()
+        );
+        let out = std::process::Command::new("/bin/bash")
+            .arg("-c")
+            .arg(wrap_posix_shell_command(&script))
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let marker = dir.path().join("PWNED");
+        assert!(
+            !marker.exists(),
+            "injected touch executed — escaping is broken"
+        );
+        let listing = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            listing.contains("x'; touch"),
+            "evil name must be listed: {listing}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn which_fish() -> Option<String> {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("command -v fish")
+            .output()
+            .ok()?;
+        if out.status.success() {
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        } else {
+            None
+        }
     }
 }

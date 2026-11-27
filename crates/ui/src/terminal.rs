@@ -1569,10 +1569,18 @@ impl RemoteSshSpec {
             self.remote_dir.trim()
         };
         let esc_dir = clean_dir.replace('\'', "'\\''");
-        let sh_expr = "${SHELL:-/bin/sh}";
-        let rdy = format!("printf '{sentinel_tag}\\r'");
-        let remote_cmd = format!("{rdy}; cd -- '{esc_dir}' 2>/dev/null; exec \"{sh_expr}\" -l");
-        args.push(remote_cmd);
+        // N01: the readiness sentinel, the cd and the login-shell exec
+        // form one POSIX script; the base64 wrapper keeps the user's
+        // login shell (Fish!) from ever parsing `${SHELL:-/bin/sh}` or
+        // the `'\''` escape. The sentinel is printed by the inner sh
+        // before the login shell is exec'd, so the reader thread still
+        // sees exactly one `TAG\r` to strip; Fish users then get their
+        // own interactive shell (the `-tt` TTY is inherited).
+        let script = format!(
+            "printf '{sentinel_tag}\\r'; cd -- '{esc_dir}' 2>/dev/null; \
+             exec \"${{SHELL:-/bin/sh}}\" -l"
+        );
+        args.push(manifold_vfs_remote::wrap_posix_shell_command(&script));
         args
     }
 }
@@ -2817,6 +2825,32 @@ mod tests {
         assert!(row1.starts_with("┌───┐"));
     }
 
+    /// N01: minimal base64 decoder for asserting wrapped remote commands
+    /// without spawning the system `base64` (works on every platform).
+    fn n01_b64_decode(b64: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut acc = 0u32;
+        let mut nbits = 0u32;
+        for c in b64.bytes() {
+            let v = match c {
+                b'A'..=b'Z' => c - b'A',
+                b'a'..=b'z' => c - b'a' + 26,
+                b'0'..=b'9' => c - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' => break,
+                _ => continue,
+            } as u32;
+            acc = (acc << 6) | v;
+            nbits += 6;
+            if nbits >= 8 {
+                nbits -= 8;
+                out.push((acc >> nbits) as u8);
+            }
+        }
+        out
+    }
+
     #[test]
     fn test_remote_ssh_spec_builds_interactive_pty_args() {
         let spec = RemoteSshSpec {
@@ -2833,7 +2867,26 @@ mod tests {
         assert!(args.contains(&"--".to_string()));
         assert!(args.contains(&"root@192.168.8.110".to_string()));
         let last = args.last().cloned().unwrap_or_default();
-        assert!(last.contains("cd -- '/var/log'"));
+        // N01: the outer command is only the shell-safe base64 pipeline;
+        // the POSIX script (sentinel, cd, login-shell exec) lives in the
+        // decoded payload so Fish/csh can never mis-parse it.
+        assert!(
+            last.starts_with("echo ") && last.ends_with("| base64 -d | sh"),
+            "outer command must be the base64 wrapper: {last}"
+        );
+        let b64 = last
+            .trim_start_matches("echo ")
+            .trim_end_matches(" | base64 -d | sh");
+        let decoded = String::from_utf8(n01_b64_decode(b64)).unwrap();
+        assert!(
+            decoded.starts_with("printf '__MANIFOLD_SSH_READY__\\r'"),
+            "{decoded}"
+        );
+        assert!(decoded.contains("cd -- '/var/log'"), "{decoded}");
+        assert!(
+            decoded.contains("exec \"${SHELL:-/bin/sh}\" -l"),
+            "{decoded}"
+        );
 
         let bad_spec = RemoteSshSpec {
             conn_name: "Bad".to_string(),

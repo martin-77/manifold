@@ -1289,6 +1289,7 @@ fn test_scoped_cache_invalidation_and_async_dir_load_generations() {
         gen_id: cur_gen.wrapping_add(99),
         dir_path: dir_a.to_string(),
         entries: vec![sample_meta("stale_entry.txt")],
+        error: None,
         fingerprint: Some(42),
         mtime: None,
         vol_stats: None,
@@ -1308,6 +1309,7 @@ fn test_scoped_cache_invalidation_and_async_dir_load_generations() {
         gen_id: cur_gen,
         dir_path: dir_a.to_string(),
         entries: fresh,
+        error: None,
         fingerprint: Some(fp),
         mtime: None,
         vol_stats: None,
@@ -1372,4 +1374,46 @@ fn staging_sync_success_drains_and_clears_in_flight() {
         "the in-flight marker must be cleared on completion"
     );
     assert!(rt.logs.iter().any(|l| l.contains("Auto-uploaded 2")));
+}
+
+/// N01: a FAILED remote directory listing must surface the error and
+/// must NOT replace the pane with an empty listing — that is how a
+/// Fish-broken SFTP share used to look like an empty directory.
+#[test]
+fn failed_dir_listing_surfaces_error_and_keeps_pane() {
+    let mut rt = GuiRuntime::new(ManifoldAppState::new_reference_workspace());
+    let dir = "/tmp/manifold-n01-keep";
+    rt.set_current_pane_path(false, dir.to_string());
+    rt.dir_cache
+        .borrow_mut()
+        .insert(dir.to_string(), vec![sample_meta("keepme.txt")]);
+    rt.left_dir_loading = true;
+    let gen = rt.left_dir_load_gen.load(Ordering::Relaxed);
+    let _ = rt.dir_load_tx.send(BgDirLoadEvent {
+        is_right: false,
+        gen_id: gen,
+        dir_path: dir.to_string(),
+        entries: Vec::new(),
+        error: Some("fish: expected an operator".to_string()),
+        fingerprint: None,
+        mtime: None,
+        vol_stats: None,
+    });
+    let synced = rt.poll_bg_dir_loads();
+    assert!(synced, "the loading state must be flushed");
+    assert!(!rt.left_dir_loading);
+    assert!(
+        rt.logs
+            .iter()
+            .any(|l| l.contains("Could not list") && l.contains("fish: expected")),
+        "the listing error must reach the log: {:?}",
+        rt.logs
+    );
+    assert!(
+        rt.dir_cache
+            .borrow()
+            .get(dir)
+            .is_some_and(|v| v.iter().any(|e| e.name == "keepme.txt")),
+        "a failed listing must not wipe the cached pane content"
+    );
 }

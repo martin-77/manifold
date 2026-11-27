@@ -278,6 +278,10 @@ struct BgDirLoadEvent {
     gen_id: u64,
     dir_path: String,
     entries: Vec<FileMetadata>,
+    /// N01: `Some` when the listing FAILED. A failed remote listing must
+    /// never be presented as an empty directory — the pane keeps its
+    /// previous content and the error is surfaced to the user.
+    error: Option<String>,
     fingerprint: Option<u64>,
     mtime: Option<(u64, u32)>,
     vol_stats: Option<manifold_vfs::VolumeStats>,
@@ -3054,20 +3058,26 @@ impl GuiRuntime {
                 if gen_arc.load(Ordering::Relaxed) != my_gen {
                     return;
                 }
-                let entries = if let Some(remote) = remote_opt {
-                    let mut list = remote.list_directory(&remote_sub).unwrap_or_default();
-                    for entry in &mut list {
-                        entry.path = format!("{prefix}{}", entry.path);
-                    }
-                    list
-                } else {
-                    Vec::new()
+                // N01: propagate the listing error instead of masking it
+                // with an empty Vec.
+                let (list, error) = match remote_opt {
+                    Some(remote) => match remote.list_directory(&remote_sub) {
+                        Ok(mut list) => {
+                            for entry in &mut list {
+                                entry.path = format!("{prefix}{}", entry.path);
+                            }
+                            (list, None)
+                        }
+                        Err(e) => (Vec::new(), Some(format!("{e}"))),
+                    },
+                    None => (Vec::new(), Some("session is not connected".to_string())),
                 };
                 let _ = tx.send(BgDirLoadEvent {
                     is_right,
                     gen_id: my_gen,
                     dir_path,
-                    entries,
+                    entries: list,
+                    error,
                     fingerprint: None,
                     mtime: None,
                     vol_stats: None,
@@ -3081,7 +3091,11 @@ impl GuiRuntime {
             if gen_arc.load(Ordering::Relaxed) != my_gen {
                 return;
             }
-            let entries = local_vfs.list_directory(&dir_path).unwrap_or_default();
+            // N01: propagate local listing failures too.
+            let (entries, error) = match local_vfs.list_directory(&dir_path) {
+                Ok(list) => (list, None),
+                Err(e) => (Vec::new(), Some(format!("{e}"))),
+            };
             if gen_arc.load(Ordering::Relaxed) != my_gen {
                 return;
             }
@@ -3096,6 +3110,7 @@ impl GuiRuntime {
                 gen_id: my_gen,
                 dir_path,
                 entries,
+                error,
                 fingerprint: fp,
                 mtime,
                 vol_stats,
@@ -3123,6 +3138,16 @@ impl GuiRuntime {
                 self.left_dir_loading = false;
                 w
             };
+            // N01: a FAILED listing must never replace the pane with an
+            // empty one (that is how a Fish-broken SFTP looked like an
+            // empty share). Keep the previous content, surface the error.
+            if let Some(err) = ev.error {
+                let msg = format!("Could not list {}: {err}", ev.dir_path);
+                self.logs.push(format!("[DIR_ERR] {msg}"));
+                self.show_toast("error", msg);
+                need_ui_sync = was_loading;
+                continue;
+            }
             if let Some(vs) = ev.vol_stats {
                 self.vol_stats_cache
                     .borrow_mut()
