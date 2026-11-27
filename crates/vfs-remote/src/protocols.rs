@@ -1827,6 +1827,7 @@ mod hardening_tests {
         dir
     }
 
+    #[cfg(unix)] // only used by the fake-curl harness tests (R14)
     fn s3_profile() -> ConnectionProfile {
         let mut profile = ConnectionProfile::new_sftp_default("s3-1", "Test Bucket");
         profile.protocol = ProtocolType::S3;

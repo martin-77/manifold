@@ -1845,8 +1845,12 @@ impl FileSystemBackend for LocalFsBackend {
                         VfsError::IoError(e)
                     });
                 }
-                let ty = (st.st_mode as u32) & (libc::S_IFMT as u32);
-                if ty == (libc::S_IFDIR as u32) && recursive {
+                // u64 widening keeps the mask comparisons free of
+                // same-type casts (st_mode/S_IFMT types differ per unix
+                // flavour: u16/i32 on macOS, u32 on Linux).
+                let mode = st.st_mode as u64;
+                let is_dir = mode & (libc::S_IFMT as u64) == (libc::S_IFDIR as u64);
+                if is_dir && recursive {
                     // Recursive walks need path semantics; verify the
                     // target directory through its own open descriptor
                     // first so a final-component swap is rejected before
@@ -1856,7 +1860,7 @@ impl FileSystemBackend for LocalFsBackend {
                     let child = fs::File::open(&resolved).map_err(VfsError::IoError)?;
                     self.verify_fd_in_sandbox(&child, path)?;
                     fs::remove_dir_all(&resolved)?;
-                } else if ty == (libc::S_IFDIR as u32) {
+                } else if is_dir {
                     let rc = unsafe {
                         libc::unlinkat(dir.as_raw_fd(), c_name.as_ptr(), libc::AT_REMOVEDIR)
                     };
