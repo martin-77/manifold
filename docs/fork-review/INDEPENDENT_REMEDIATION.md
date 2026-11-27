@@ -193,12 +193,15 @@ fixable from this repository (slint 1.19.1 still pins zbus ≥ 5.14).
 ## Limitations and honest gaps
 
 1. **GitHub Actions is disabled on the fork** (`martin-77/manifold`,
-   HTTP 422 "Actions has been disabled for this repository"). The last
-   green CI run covers `7639289`-era commits; `a1457f3`, `d6edefa`,
-   `f486311`, `c90afd9`, `d715a2d`, `c3c16a9`, `bf807df`, `f3edac1`
-   have **no CI proof** — the local gate (full workspace tests, strict
-   clippy host + Windows cross-lint) is the only evidence. Re-enabling
-   Actions and re-running CI is an external prerequisite.
+   HTTP 422 "Actions has been disabled for this repository"). No Round 2
+   commit has a completed green CI run: `ca43933`, `4bee717` and
+   `7639289` failed on platform issues (the repairs are in `7639289` and
+   `a1457f3`), and the `a1457f3` run was cancelled by the user before
+   Actions was found disabled — so `a1457f3` … `f3edac1` plus this docs
+   commit have **no CI proof**. The local gate (full workspace tests,
+   strict clippy host + Windows cross-lint) is the only evidence.
+   Re-enabling Actions and re-running CI on `macos-dev` is an external
+   prerequisite.
 2. **Smoke test scope:** the release smoke test (binary builds, starts,
    stays stable, exits, v0.8.0) is the functional baseline. It is not
    comprehensive functional or data-safety validation; no claim of that
