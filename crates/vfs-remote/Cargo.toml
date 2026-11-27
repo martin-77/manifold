@@ -11,6 +11,8 @@ description = "Remote VFS connectors (SFTP, S3, GCS, Azure, Google Drive, FTP, W
 manifold-config.workspace = true
 manifold-vfs.workspace = true
 serde.workspace = true
+# R09: staging manifest persistence (recover_from_disk / persist_manifest)
+serde_json.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 

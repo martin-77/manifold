@@ -1813,12 +1813,47 @@ fn parse_ls_ldn_find_output(
 }
 
 /// Staged file entry managed by [`RemoteEditStagingManager`] (`Section 3.7` of `BRIEF.md`).
-#[derive(Debug, Clone)]
+/// R09: serialisable so the manifest survives restarts — an edited but
+/// not yet uploaded staging copy is user data and must be recoverable.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StagedRemoteFile {
     pub session_id: String,
     pub remote_path: String,
     pub local_staging_path: PathBuf,
+    #[serde(with = "sha256_hex")]
     pub last_sha256: [u8; 32],
+}
+
+/// R09: hex encoding keeps the on-disk manifest human-readable and
+/// stable across serde versions (raw [u8; 32] would be a numeric array).
+mod sha256_hex {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let raw = String::deserialize(d)?;
+        let trimmed = raw.trim();
+        if trimmed.len() != 64 {
+            return Err(serde::de::Error::custom("sha256 must be 64 hex chars"));
+        }
+        let mut out = [0u8; 32];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = u8::from_str_radix(&trimmed[i * 2..i * 2 + 2], 16)
+                .map_err(serde::de::Error::custom)?;
+        }
+        Ok(out)
+    }
+
+    fn hex(bytes: &[u8; 32]) -> String {
+        let mut s = String::with_capacity(64);
+        for b in bytes {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
 }
 
 /// Implements Remote File Editing (Edit-in-Place) using
@@ -1852,6 +1887,99 @@ impl RemoteEditStagingManager {
 
     pub fn cache_root(&self) -> &Path {
         &self.cache_root
+    }
+
+    /// R09: path of the on-disk manifest that makes the in-memory
+    /// `staged_files` list survive restarts.
+    fn manifest_path(&self) -> PathBuf {
+        self.cache_root.join("manifest.json")
+    }
+
+    /// R09: best-effort atomic write of the manifest after every change.
+    /// A failed persist must not fail the actual staging operation — the
+    /// worst case is losing recovery information, never corrupting data.
+    fn persist_manifest(&self) {
+        // A poisoned lock means the in-memory state is unknown: writing
+        // an empty manifest then would DESTROY the recovery data, so
+        // skip persisting entirely instead.
+        let Ok(guard) = self.staged_files.read() else {
+            return;
+        };
+        let entries: Vec<StagedRemoteFile> = guard.clone();
+        drop(guard);
+        if let Ok(json) = serde_json::to_vec_pretty(&entries) {
+            let _ = manifold_vfs::atomic_write_bytes(&self.manifest_path(), &json);
+        }
+    }
+
+    /// R09: load the persisted manifest after startup and merge it into
+    /// the in-memory list. Entries whose local staging copy vanished
+    /// (already uploaded + purged, or manual cleanup) are dropped.
+    /// Returns the number of recovered entries.
+    pub fn recover_from_disk(&self) -> usize {
+        let Ok(raw) = fs::read(self.manifest_path()) else {
+            return 0;
+        };
+        let entries: Vec<StagedRemoteFile> = match serde_json::from_slice(&raw) {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("[staging] ignoring corrupt manifest: {err}");
+                return 0;
+            }
+        };
+        let mut recovered = 0usize;
+        let Ok(mut guard) = lock_write(&self.staged_files, "staged files") else {
+            return 0;
+        };
+        for entry in entries {
+            if !entry.local_staging_path.is_file() {
+                continue;
+            }
+            let known = guard
+                .iter()
+                .any(|s| s.session_id == entry.session_id && s.remote_path == entry.remote_path);
+            if !known {
+                guard.push(entry);
+                recovered += 1;
+            }
+        }
+        recovered
+    }
+
+    /// R09: remove staging files that the manifest no longer references
+    /// (crash leftovers from interrupted uploads). The manifest itself is
+    /// never deleted here. Returns the number of removed files.
+    pub fn purge_orphaned_files(&self) -> usize {
+        // Poisoned lock → unknown referenced set; purging would delete
+        // user data, so refuse instead.
+        let Ok(guard) = self.staged_files.read() else {
+            return 0;
+        };
+        let referenced: Vec<PathBuf> = guard.iter().map(|s| s.local_staging_path.clone()).collect();
+        drop(guard);
+        let mut removed = 0usize;
+        let Ok(session_dirs) = fs::read_dir(&self.cache_root) else {
+            return 0;
+        };
+        for dir_entry in session_dirs.flatten() {
+            let path = dir_entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Ok(files) = fs::read_dir(&path) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let fp = file.path();
+                if fp.is_file()
+                    && !referenced.iter().any(|r| r == &fp)
+                    && fs::remove_file(&fp).is_ok()
+                {
+                    removed += 1;
+                }
+            }
+        }
+        removed
     }
 
     /// Downloads `remote_path` from `backend` into `$XDG_CACHE_HOME/manifold/staging/<session_id>/<filename>`.
@@ -1900,6 +2028,8 @@ impl RemoteEditStagingManager {
                 last_sha256: digest,
             });
         }
+        drop(guard);
+        self.persist_manifest();
 
         Ok(local_staging_path)
     }
@@ -1917,12 +2047,23 @@ impl RemoteEditStagingManager {
     ) -> Result<usize, VfsError> {
         let mut guard = lock_write(&self.staged_files, "staged files")?;
         let mut uploaded = 0usize;
+        // R09: failures are collected instead of returning through `?` so
+        // the manifest is always persisted afterwards — uploads that
+        // already succeeded must not be re-done (or lost) on the next
+        // startup recovery.
+        let mut failure: Option<VfsError> = None;
         for staged in guard.iter_mut() {
             if session_id.is_some_and(|sid| staged.session_id != sid) {
                 continue;
             }
             if staged.local_staging_path.exists() {
-                let current_bytes = fs::read(&staged.local_staging_path)?;
+                let current_bytes = match fs::read(&staged.local_staging_path) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        failure = Some(e.into());
+                        break;
+                    }
+                };
                 let current_hash: [u8; 32] = Sha256::digest(&current_bytes).into();
                 if current_hash != staged.last_sha256 {
                     // F-19 / R11: refuse last-writer-wins. The remote
@@ -1932,20 +2073,24 @@ impl RemoteEditStagingManager {
                     // would destroy a concurrent edit exactly when the
                     // connection is flaky. A vanished remote file is also
                     // a concurrent change (someone deleted it).
-                    let remote_bytes = backend.read_bytes(&staged.remote_path).map_err(|e| {
-                        VfsError::OperationFailed(
-                            staged.remote_path.clone(),
-                            format!(
-                                "cannot verify the remote state before uploading ({e}); \
+                    let remote_bytes = match backend.read_bytes(&staged.remote_path) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            failure = Some(VfsError::OperationFailed(
+                                staged.remote_path.clone(),
+                                format!(
+                                    "cannot verify the remote state before uploading ({e}); \
                                      upload aborted to protect possible concurrent edits. \
                                      Your version is kept at {}",
-                                staged.local_staging_path.display()
-                            ),
-                        )
-                    })?;
+                                    staged.local_staging_path.display()
+                                ),
+                            ));
+                            break;
+                        }
+                    };
                     let remote_hash: [u8; 32] = Sha256::digest(&remote_bytes).into();
                     if remote_hash != staged.last_sha256 {
-                        return Err(VfsError::OperationFailed(
+                        failure = Some(VfsError::OperationFailed(
                             staged.remote_path.clone(),
                             format!(
                                 "remote file changed since it was staged; upload \
@@ -1954,14 +2099,23 @@ impl RemoteEditStagingManager {
                                 staged.local_staging_path.display()
                             ),
                         ));
+                        break;
                     }
-                    backend.write_bytes(&staged.remote_path, &current_bytes)?;
+                    if let Err(e) = backend.write_bytes(&staged.remote_path, &current_bytes) {
+                        failure = Some(e);
+                        break;
+                    }
                     staged.last_sha256 = current_hash;
                     uploaded += 1;
                 }
             }
         }
-        Ok(uploaded)
+        drop(guard);
+        self.persist_manifest();
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(uploaded),
+        }
     }
 
     /// Returns all active session IDs that currently have staged files.
@@ -1984,6 +2138,8 @@ impl RemoteEditStagingManager {
     pub fn purge_session(&self, session_id: &str) -> Result<(), VfsError> {
         let mut guard = lock_write(&self.staged_files, "staged files")?;
         guard.retain(|f| f.session_id != session_id);
+        drop(guard);
+        self.persist_manifest();
         let session_dir = self.cache_root.join(session_id);
         if session_dir.exists() {
             fs::remove_dir_all(&session_dir)?;
@@ -2348,6 +2504,88 @@ mod tests {
             std::fs::read(&staged_path).unwrap(),
             b"v2 edited",
             "the local edit must stay available"
+        );
+    }
+
+    // ---- R09: the staging manifest must survive restarts ----
+
+    #[test]
+    fn staging_manifest_recovers_unuploaded_edits_after_restart() {
+        use manifold_vfs::{ArchiveBackend, ArchiveFormat};
+        let remote = ArchiveBackend::new("rec.zip", ArchiveFormat::Zip);
+        remote.write_bytes("/notes.txt", b"v1").unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = RemoteEditStagingManager::new(Some(tmp.path().to_path_buf()));
+        let staged_path = staging
+            .stage_for_external_edit("sess-r", "/notes.txt", &remote)
+            .unwrap();
+        std::fs::write(&staged_path, b"edited-while-offline").unwrap();
+
+        // Simulate a restart: a brand-new manager over the same cache.
+        let fresh = RemoteEditStagingManager::new(Some(tmp.path().to_path_buf()));
+        assert!(
+            fresh.active_session_ids().is_empty(),
+            "a new manager starts without in-memory entries"
+        );
+        assert_eq!(
+            fresh.recover_from_disk(),
+            1,
+            "manifest must restore the entry"
+        );
+        let uploaded = fresh
+            .sync_modified_files_for_session(Some("sess-r"), &remote)
+            .unwrap();
+        assert_eq!(
+            uploaded, 1,
+            "the pending edit must be uploaded after recovery"
+        );
+        assert_eq!(
+            remote.read_bytes("/notes.txt").unwrap(),
+            b"edited-while-offline"
+        );
+    }
+
+    #[test]
+    fn staging_purge_removes_orphans_and_keeps_referenced() {
+        use manifold_vfs::{ArchiveBackend, ArchiveFormat};
+        let remote = ArchiveBackend::new("orph.zip", ArchiveFormat::Zip);
+        remote.write_bytes("/a.txt", b"a").unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = RemoteEditStagingManager::new(Some(tmp.path().to_path_buf()));
+        let staged = staging
+            .stage_for_external_edit("sess-p", "/a.txt", &remote)
+            .unwrap();
+        let session_dir = staged.parent().unwrap();
+        let stray = session_dir.join("leftover-crash.txt");
+        std::fs::write(&stray, b"leftover").unwrap();
+
+        let removed = staging.purge_orphaned_files();
+        assert!(removed >= 1, "the stray file must be purged");
+        assert!(!stray.exists());
+        assert!(staged.exists(), "manifest-referenced files must survive");
+    }
+
+    #[test]
+    fn staging_manifest_prunes_entries_whose_file_vanished() {
+        use manifold_vfs::{ArchiveBackend, ArchiveFormat};
+        let remote = ArchiveBackend::new("prune.zip", ArchiveFormat::Zip);
+        remote.write_bytes("/gone.txt", b"x").unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = RemoteEditStagingManager::new(Some(tmp.path().to_path_buf()));
+        let staged = staging
+            .stage_for_external_edit("sess-g", "/gone.txt", &remote)
+            .unwrap();
+        // External deletion (e.g. user cleaned the cache dir).
+        std::fs::remove_file(&staged).unwrap();
+
+        let fresh = RemoteEditStagingManager::new(Some(tmp.path().to_path_buf()));
+        assert_eq!(
+            fresh.recover_from_disk(),
+            0,
+            "entries whose local copy vanished must not be recovered"
         );
     }
 

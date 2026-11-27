@@ -9914,17 +9914,42 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
         }
     }
 
+    // R09: the edit-in-place manifest is persisted so unuploaded local
+    // edits survive a restart. Recover the entries, then drop staging
+    // files the manifest no longer references (crash leftovers from
+    // interrupted uploads). The periodic poller (`poll_remote_staged_
+    // edits`) re-uploads recovered edits once the session reconnects —
+    // the F-19/R11 remote check protects concurrent changes meanwhile.
+    {
+        let recovered = rt.borrow().remote_edit_staging.recover_from_disk();
+        let orphans = rt.borrow().remote_edit_staging.purge_orphaned_files();
+        if recovered > 0 || orphans > 0 {
+            eprintln!("[staging] recovered {recovered} staged edit(s), purged {orphans} orphan(s)");
+        }
+    }
+
     let run_res = window.run().map_err(|e| e.to_string());
     rt.borrow().capture_and_save_session(&window);
-    manifold_vfs::cleanup_secure_runtime_subdirs(&[
+    // R09: `staging` is deliberately NOT cleaned here: it can hold user
+    // edits that were never uploaded (failing network at shutdown), and
+    // deleting them would be data loss. Entries are removed by
+    // `purge_session` when the user discards/closes them; orphan
+    // collection runs at the next startup above.
+    manifold_vfs::cleanup_secure_runtime_subdirs(disposable_runtime_subdirs());
+    run_res
+}
+
+/// R09: runtime subdirectories that only ever hold disposable caches.
+/// `staging` must NEVER be added — it holds user edit-in-place data
+/// whose lifecycle is owned by `RemoteEditStagingManager`.
+pub(crate) fn disposable_runtime_subdirs() -> &'static [&'static str] {
+    &[
         "drag",
         "drag-out",
         "archive-preview",
         "cross-remote",
-        "staging",
         "archive-contents",
-    ]);
-    run_res
+    ]
 }
 
 #[cfg(test)]

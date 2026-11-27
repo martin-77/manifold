@@ -1319,3 +1319,17 @@ fn test_scoped_cache_invalidation_and_async_dir_load_generations() {
     let _ = std::fs::remove_dir_all(dir_a);
     let _ = std::fs::remove_dir_all(dir_b);
 }
+
+/// R09: the shutdown cleanup must never delete the edit-in-place staging
+/// directory — it can hold user edits that were never uploaded.
+#[test]
+fn disposable_runtime_subdirs_exclude_user_staging() {
+    let dirs = super::disposable_runtime_subdirs();
+    assert!(
+        !dirs.contains(&"staging"),
+        "`staging` holds user edit-in-place data and must not be \
+         auto-purged at shutdown (recovered via the persisted manifest): {dirs:?}"
+    );
+    // The disposable caches themselves stay on the list.
+    assert!(dirs.contains(&"drag-out"));
+}
