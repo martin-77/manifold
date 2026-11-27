@@ -338,6 +338,14 @@ impl TransferEngine {
     }
 
     /// Executes a single task across `src_vfs` and `dst_vfs` using chunked I/O and conflict resolution.
+    ///
+    /// NOTE (R16): this engine path is currently exercised by tests
+    /// only; the GUI executes transfers through its own worker
+    /// (`crates/ui/src/gui/transfer_worker.rs::perform_bg_single_transfer`),
+    /// which additionally fsyncs the staged part and uses the swap
+    /// journal. The two paths must not diverge silently — see
+    /// `docs/fork-review/TRANSFER_ENGINE_MIGRATION.md` for the
+    /// consolidation plan.
     pub fn execute_task(
         &self,
         task: TransferTask,

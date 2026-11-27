@@ -982,6 +982,11 @@ pub(super) fn copy_archive_dir_to_local(
     Ok(())
 }
 
+/// The GUI's production transfer path (local/archive/remote directions,
+/// progress events, fsync + swap-journal publish). It duplicates parts of
+/// `TransferEngine::execute_task_controlled` (`crates/transfer`); changes
+/// to durability or conflict semantics must be checked against BOTH
+/// paths — see `docs/fork-review/TRANSFER_ENGINE_MIGRATION.md` (R16).
 pub(super) fn perform_bg_single_transfer(
     local_vfs: &LocalFsBackend,
     remotes: &HashMap<String, RemoteVfsBackend>,
