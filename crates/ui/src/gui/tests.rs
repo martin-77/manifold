@@ -1333,3 +1333,43 @@ fn disposable_runtime_subdirs_exclude_user_staging() {
     // The disposable caches themselves stay on the list.
     assert!(dirs.contains(&"drag-out"));
 }
+
+/// R13: a failed background staged-edit sync must reach the user. The
+/// old synchronous poll dropped `sync_modified_files_for_session`
+/// errors via `if let Ok(..)`, so a refused upload (F-19/R11 conflict,
+/// network down) left the user with no explanation.
+#[test]
+fn staging_sync_error_is_surfaced_to_user() {
+    let mut rt = GuiRuntime::new(ManifoldAppState::new_reference_workspace());
+    let err_msg = "remote file changed since it was staged; upload aborted".to_string();
+    rt.staging_sync_tx
+        .send(("sess-r13".to_string(), Err(err_msg.clone())))
+        .unwrap();
+    let changed = rt.poll_remote_staged_edits();
+    assert!(changed, "a surfaced sync error must request a refresh");
+    assert!(
+        rt.logs
+            .iter()
+            .any(|l| l.contains("sess-r13") && l.contains(&err_msg)),
+        "the sync error must appear in the log: {:?}",
+        rt.logs
+    );
+}
+
+/// R13: successful background syncs are drained and counted; the
+/// in-flight marker is cleared so the next spawn slot can run again.
+#[test]
+fn staging_sync_success_drains_and_clears_in_flight() {
+    let mut rt = GuiRuntime::new(ManifoldAppState::new_reference_workspace());
+    rt.staging_sync_in_flight.insert("sess-ok".to_string());
+    rt.staging_sync_tx
+        .send(("sess-ok".to_string(), Ok(2)))
+        .unwrap();
+    let changed = rt.poll_remote_staged_edits();
+    assert!(changed);
+    assert!(
+        !rt.staging_sync_in_flight.contains("sess-ok"),
+        "the in-flight marker must be cleared on completion"
+    );
+    assert!(rt.logs.iter().any(|l| l.contains("Auto-uploaded 2")));
+}

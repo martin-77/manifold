@@ -1975,6 +1975,9 @@ mod sha256_hex {
 
 /// Implements Remote File Editing (Edit-in-Place) using
 /// `$XDG_CACHE_HOME/manifold/staging/<session_id>/<filename>`.
+/// R13: `Clone` is cheap (Arc-based) so the periodic sync can run on a
+/// background worker thread while the GUI timer stays responsive.
+#[derive(Clone)]
 pub struct RemoteEditStagingManager {
     cache_root: PathBuf,
     staged_files: Arc<RwLock<Vec<StagedRemoteFile>>>,

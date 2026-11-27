@@ -426,6 +426,17 @@ struct GuiRuntime {
     open_with_all_apps: Vec<OpenWithAppSlint>,
     fs_poll_tick: u32,
     staging_poll_tick: u32,
+    /// R13: result channel of the backgrounded staged-edit sync —
+    /// `(session_id, uploaded count or error)`. The sync performs
+    /// network reads/uploads, which must not run on the GUI timer
+    /// thread (same defect class F-23 fixed for drag-out).
+    staging_sync_tx: mpsc::Sender<(String, Result<usize, String>)>,
+    staging_sync_rx: mpsc::Receiver<(String, Result<usize, String>)>,
+    /// R13: sessions with a background sync currently running; prevents
+    /// overlapping uploads of the same staged files.
+    staging_sync_in_flight: HashSet<String>,
+    /// R13: throttles the network-mount detection to every 8th tick.
+    mount_poll_tick: u32,
     session_save_tick: u32,
     session_dirty: bool,
     native_os_drag_handed_off: bool,
@@ -557,6 +568,8 @@ impl GuiRuntime {
         let (watch_req_tx, watch_req_rx) = mpsc::channel::<BgWatchRequest>();
         let (watch_res_tx, watch_res_rx) = mpsc::channel::<Vec<BgWatchChange>>();
         let (session_save_tx, session_save_rx) = mpsc::channel::<SessionState>();
+        // R13: results of the backgrounded staged-edit sync (see field docs).
+        let (staging_sync_tx, staging_sync_rx) = mpsc::channel::<(String, Result<usize, String>)>();
         let (update_tx, update_rx) = mpsc::channel();
 
         let watch_vfs = local_vfs.clone();
@@ -721,6 +734,10 @@ impl GuiRuntime {
             open_with_all_apps: Vec::new(),
             fs_poll_tick: 0,
             staging_poll_tick: 0,
+            staging_sync_tx,
+            staging_sync_rx,
+            staging_sync_in_flight: HashSet::new(),
+            mount_poll_tick: 0,
             session_save_tick: 0,
             session_dirty: false,
             native_os_drag_handed_off: false,
@@ -1134,41 +1151,90 @@ impl GuiRuntime {
             }
         }
 
-        let mounts_changed = self.sync_active_network_mounts();
+        // R13: mount detection read /proc/mounts on EVERY timer tick
+        // (4-22× a second). Refresh it at most every 8th tick instead;
+        // the first tick still runs so the sidebar populates promptly.
+        self.mount_poll_tick = self.mount_poll_tick.wrapping_add(1);
+        let mounts_changed = if self.mount_poll_tick == 1 || self.mount_poll_tick.is_multiple_of(8)
+        {
+            self.sync_active_network_mounts()
+        } else {
+            false
+        };
         let staged_changed = self.poll_remote_staged_edits();
         left_changed || right_changed || mounts_changed || staged_changed
     }
 
+    /// R13: the staged-edit upload runs on a background worker, not on
+    /// the GUI timer thread. The old synchronous path performed remote
+    /// `read_bytes` (conflict check) and `write_bytes` (upload) inside
+    /// the 45/250 ms feedback timer — a slow or failing connection froze
+    /// the whole UI for the duration of every network round-trip. The
+    /// worker reports back through `staging_sync_rx`; results (including
+    /// the F-19/R11 conflict errors, which used to be silently dropped)
+    /// are surfaced to the user here.
     fn poll_remote_staged_edits(&mut self) -> bool {
-        self.staging_poll_tick = self.staging_poll_tick.wrapping_add(1);
-        if !self.staging_poll_tick.is_multiple_of(2) {
-            return false;
-        }
-        let sessions = self.remote_edit_staging.active_session_ids();
-        if sessions.is_empty() {
-            return false;
-        }
+        // 1. Drain completed background syncs — every tick, so results
+        //    appear without waiting for the next spawn slot.
         let mut total_synced = 0usize;
-        for sess_id in sessions {
-            let remote_opt = self
-                .remote_backends
-                .values()
-                .find(|b| b.profile().id == sess_id)
-                .cloned();
-            if let Some(remote) = remote_opt {
-                if let Ok(count) = self
-                    .remote_edit_staging
-                    .sync_modified_files_for_session(Some(&sess_id), &remote)
-                {
-                    total_synced += count;
+        let mut surfaced_error = false;
+        while let Ok((sess_id, result)) = self.staging_sync_rx.try_recv() {
+            self.staging_sync_in_flight.remove(&sess_id);
+            match result {
+                Ok(count) => total_synced += count,
+                Err(err) => {
+                    // R13: these were swallowed by `if let Ok(..)` before;
+                    // a refused upload (remote changed, network down) must
+                    // reach the user or staged data looks lost forever.
+                    surfaced_error = true;
+                    let msg = format!("[STAGING] {sess_id}: {err}");
+                    self.logs.push(msg);
+                    self.show_toast("error", err);
                 }
             }
         }
-        if total_synced > 0 {
-            let banner = format!("Auto-uploaded {total_synced} modified remote file(s)");
-            let msg = format!("[STAGING] {banner}");
-            self.logs.push(msg);
-            self.show_toast("info", banner);
+
+        // 2. Spawn new syncs at the reduced cadence (every 2nd tick).
+        self.staging_poll_tick = self.staging_poll_tick.wrapping_add(1);
+        if self.staging_poll_tick.is_multiple_of(2) {
+            let sessions = self.remote_edit_staging.active_session_ids();
+            for sess_id in sessions {
+                if self.staging_sync_in_flight.contains(&sess_id) {
+                    continue; // one worker per session at a time
+                }
+                let Some(remote) = self
+                    .remote_backends
+                    .values()
+                    .find(|b| b.profile().id == sess_id)
+                    .cloned()
+                else {
+                    continue;
+                };
+                let manager = self.remote_edit_staging.clone();
+                let tx = self.staging_sync_tx.clone();
+                let id = sess_id.clone();
+                self.staging_sync_in_flight.insert(sess_id.clone());
+                let spawn_res = std::thread::Builder::new()
+                    .name("manifold-staging-sync".to_string())
+                    .spawn(move || {
+                        let result = manager
+                            .sync_modified_files_for_session(Some(&id), &remote)
+                            .map_err(|e| e.to_string());
+                        let _ = tx.send((id, result));
+                    });
+                if spawn_res.is_err() {
+                    self.staging_sync_in_flight.remove(&sess_id);
+                }
+            }
+        }
+
+        if total_synced > 0 || surfaced_error {
+            if total_synced > 0 {
+                let banner = format!("Auto-uploaded {total_synced} modified remote file(s)");
+                let msg = format!("[STAGING] {banner}");
+                self.logs.push(msg);
+                self.show_toast("info", banner);
+            }
             self.invalidate_dir_cache();
             self.reload_pane_entries(false);
             if self.app_state.dual_pane_enabled {
@@ -9884,6 +9950,15 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
             // F-22: keep the 45 ms cadence only while something animates,
             // polls or waits for user gestures; when fully idle, wake just
             // 4× a second to cut event-loop churn and energy use.
+            // R13: the idle heartbeat is deliberately NOT stopped — it is
+            // the single drain point for every background channel (dir
+            // loads, watch results, staging sync, thumbnails) and stopping
+            // it would need a restart hook at each of those activity
+            // entry points, with a UI stall whenever one is missed. The
+            // real cost was the synchronous work inside the ticks, which
+            // R13 moved off-thread (staged uploads) or throttled (mount
+            // detection); an empty 250 ms tick only touches channels and
+            // cached state.
             let active = guard.bg_tasks_in_flight > 0
                 || guard.active_task_ticks > 0
                 || guard.sync_running
