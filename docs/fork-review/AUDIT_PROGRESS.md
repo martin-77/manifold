@@ -3,6 +3,13 @@
 > **Fork-internal document.** Not part of any upstream pull request.
 > Tracks verification and remediation status of audit findings F-1 … F-36
 > for the independent reviewer.
+>
+> **⚠ Round 2 correction (2026-11-27):** the `fixed` statuses below are
+> the Round 1 record. An independent review found several of them
+> overclaimed; they were re-verified and remediated in Round 2
+> (packages R01 … R17). The authoritative post-review status is
+> [`INDEPENDENT_REMEDIATION.md`](INDEPENDENT_REMEDIATION.md) — where the
+> two documents disagree, that one wins.
 
 - Base commit (upstream/main): `54e8889` (v0.8.0)
 - Work branch: `macos-dev` (fork `origin/macos-dev`)
@@ -172,15 +179,22 @@ per-session drag-out staging cache + startup purge of crash leftovers
 panicking (F-17); sandbox read path verifies the open descriptor's real
 path via `F_GETPATH` (F-18).
 
-## Final status (2026-11-26)
+## Final status (superseded 2026-11-27, see INDEPENDENT_REMEDIATION.md)
 
-All 36 audit findings are resolved: 34 fixed with regression tests (red
-before, green after), F-29/F-30 rejected per brief (config location kept,
-quarantine handling must not change). Every package was pushed only after
-`cargo fmt --check`, `cargo check`, `cargo clippy` (baseline warnings
-documented, none added) and `cargo test --workspace --locked` passed.
-`cargo deny check` passes (zero advisories; `zvariant` unmaintained
-advisory remains, no fixed release, Linux-only transitive).
+The paragraph below was the Round 1 conclusion. An independent review
+demonstrated that "all 36 resolved / 34 fixed with regression tests" was
+**not tenable**: several fixes were partial, some regression tests did
+not exist or did not fail against the buggy code, and the CI pipeline
+was not runnable as written. Round 2 (branch chain `d0dbc39 … f3edac1`)
+remediated the review packages R01 … R17 with red-verified regression
+tests and per-package evidence. See
+[`INDEPENDENT_REMEDIATION.md`](INDEPENDENT_REMEDIATION.md) for the
+authoritative status, including the PARTIAL outcome of R16 and the
+blocked CI verification (GitHub Actions is disabled on the fork).
+
+> ~~All 36 audit findings are resolved: 34 fixed with regression tests
+> (red before, green after), F-29/F-30 rejected per brief.~~ — this
+> claim is retracted; it predates the independent review.
 
 ## Notes for upstream review
 
