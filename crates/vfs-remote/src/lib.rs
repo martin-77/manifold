@@ -114,6 +114,116 @@ fn try_batch_mode_first(cmd_vec: &[String]) -> Option<Result<Vec<u8>, VfsError>>
     })))
 }
 
+/// R12: unique id per askpass attempt (parallel auth calls must not
+/// collide on the helper/secret file names).
+static ASKPASS_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// R12: OpenSSH-native password authentication via `SSH_ASKPASS` +
+/// `SSH_ASKPASS_REQUIRE=force` (OpenSSH >= 8.4, released 2020), tried
+/// after BatchMode and before the `python3` PTY fallback. This removes
+/// the hard `python3` dependency for the common password path.
+///
+/// The secret is handed to the askpass helper through a `0600` file in
+/// the private `0700` runtime directory — never through argv or a
+/// world-readable temp file — and both helper files are removed when the
+/// command returns. `force` makes ssh call the helper even without a
+/// controlling terminal, so no PTY is needed.
+///
+/// Returns `None` (fall through to the PTY) when ssh reports exit 255
+/// (auth/transport failure) or the helper cannot be prepared; `Some`
+/// when the command definitively succeeded or failed for a non-auth
+/// reason.
+fn try_askpass_first(cmd_vec: &[String], secret: &str) -> Option<Result<Vec<u8>, VfsError>> {
+    // The helper is a POSIX shell script; on Windows the existing
+    // fallback chain (PTY) stays in charge, same as before R12.
+    if !cfg!(unix) {
+        return None;
+    }
+    if secret.is_empty() || cmd_vec.is_empty() {
+        return None;
+    }
+    let dir = manifold_vfs::secure_runtime_subdir("askpass").ok()?;
+    std::fs::create_dir_all(&dir).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let seq = ASKPASS_SEQ.fetch_add(1, Ordering::Relaxed);
+    let secret_path = dir.join(format!("pw-{}-{seq}", std::process::id()));
+    let helper_path = dir.join(format!("askpass-{}-{seq}.sh", std::process::id()));
+    if std::fs::write(&secret_path, secret).is_err() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&secret_path, std::fs::Permissions::from_mode(0o600));
+    }
+    // The helper prints the secret on stdout; ssh feeds it to the
+    // password prompt. `printf` (not `echo`) avoids trailing-newline
+    // differences between shells.
+    let helper = format!(
+        "#!/bin/sh\nprintf '%s' \"$(cat '{}' 2>/dev/null)\"\n",
+        secret_path.display()
+    );
+    if std::fs::write(&helper_path, helper).is_err() {
+        let _ = std::fs::remove_file(&secret_path);
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&helper_path, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let mut command = Command::new(&cmd_vec[0]);
+    command
+        .args(&cmd_vec[1..])
+        .env("SSH_ASKPASS", &helper_path)
+        // `force` uses the helper without a TTY or DISPLAY, which is
+        // exactly the headless GUI-worker context here.
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let spawned = command.spawn();
+    // Cleanup regardless of how the child terminates.
+    let _guard = HelperGuard {
+        helper: helper_path.clone(),
+        secret: secret_path.clone(),
+    };
+    let out = spawned.ok()?.wait_with_output().ok()?;
+    if out.status.success() {
+        return Some(Ok(out.stdout));
+    }
+    if out.status.code() == Some(255) {
+        // Auth or transport failure: let the PTY path produce the real
+        // interactive result (or the final error) instead of guessing.
+        return None;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Some(Err(VfsError::NetworkError(if stderr.is_empty() {
+        format!("ssh exited with status {}", out.status.code().unwrap_or(-1))
+    } else {
+        stderr
+    })))
+}
+
+/// R12: removes the askpass helper + secret file on drop, so the secret
+/// never lingers in the runtime directory even when the command errors.
+struct HelperGuard {
+    helper: PathBuf,
+    secret: PathBuf,
+}
+
+impl Drop for HelperGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.helper);
+        let _ = std::fs::remove_file(&self.secret);
+    }
+}
+
 /// Parses `df -kP` (POSIX 1024-block) output into [`VolumeStats`] (F-15).
 /// Tolerates long device names (ZFS/AFS) by scanning for the numeric
 /// window `blocks used avail pct mount`.
@@ -408,6 +518,11 @@ impl RemoteVfsBackend {
             if let Some(res) = try_batch_mode_first(cmd_vec) {
                 return res;
             }
+            // R12: OpenSSH's native askpass mechanism next — password
+            // auth without the python3 PTY dependency.
+            if let Some(res) = try_askpass_first(cmd_vec, secret_str) {
+                return res;
+            }
         }
         let mut child = Command::new("python3")
             .arg("-c")
@@ -423,8 +538,10 @@ impl RemoteVfsBackend {
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     VfsError::NetworkError(
-                        "Password-authenticated SSH requires `python3`, which is not \
-                         installed. Install Python 3 or use a key-based connection."
+                        "Password-authenticated SSH failed: the OpenSSH askpass attempt did \
+                         not succeed and the interactive fallback requires `python3`, which \
+                         is not installed. Install Python 3, check the credentials, or use \
+                         a key-based connection."
                             .to_string(),
                     )
                 } else {
@@ -2655,6 +2772,111 @@ mod tests {
             .expect("must report")
             .expect_err("command failure must surface");
         assert!(err.to_string().contains("boom"), "got: {err}");
+    }
+
+    /// R12: serialises the askpass tests — they share the real
+    /// `secure_runtime_subdir("askpass")` directory.
+    #[cfg(unix)]
+    fn askpass_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ASKPASS_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ASKPASS_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// R12: password auth must work through OpenSSH's native askpass
+    /// mechanism — no python3 involved. The fake ssh plays the role of
+    /// OpenSSH >= 8.4: with SSH_ASKPASS_REQUIRE=force it executes the
+    /// helper and uses its stdout as the passphrase.
+    #[cfg(unix)]
+    #[test]
+    fn askpass_supplies_the_secret_without_python3() {
+        let _serial = askpass_lock();
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake_ssh = dir.path().join("ssh-askpass-ok");
+        std::fs::write(
+            &fake_ssh,
+            "#!/bin/sh\n\
+             if [ \"$SSH_ASKPASS_REQUIRE\" = \"force\" ] && [ -n \"$SSH_ASKPASS\" ]; then\n\
+             \t\"$SSH_ASKPASS\"\n\texit 0\n\
+             fi\n\
+             exit 255\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let res = try_askpass_first(
+            &[fake_ssh.to_string_lossy().to_string(), "user@host".into()],
+            "s3cret-pw",
+        )
+        .expect("askpass attempt must report");
+        let out = res.expect("askpass auth must succeed");
+        assert_eq!(String::from_utf8_lossy(&out), "s3cret-pw");
+    }
+
+    /// R12: an auth failure (exit 255) must fall through to the PTY
+    /// path, and the secret/helper files must be removed either way.
+    #[cfg(unix)]
+    #[test]
+    fn askpass_falls_through_on_auth_failure_and_cleans_up() {
+        let _serial = askpass_lock();
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake_ssh = dir.path().join("ssh-255");
+        std::fs::write(&fake_ssh, "#!/bin/sh\nexit 255\n").unwrap();
+        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            try_askpass_first(&[fake_ssh.to_string_lossy().to_string()], "pw").is_none(),
+            "exit 255 must fall through to the PTY fallback"
+        );
+        // No secret or helper file may linger in the askpass dir.
+        if let Ok(ask_dir) = manifold_vfs::secure_runtime_subdir("askpass") {
+            let leftovers: Vec<_> = std::fs::read_dir(&ask_dir)
+                .map(|rd| rd.flatten().collect())
+                .unwrap_or_default();
+            assert!(
+                leftovers.is_empty(),
+                "askpass dir must be clean, found: {leftovers:?}"
+            );
+        }
+    }
+
+    /// R12: the secret travels through the 0600 helper file only —
+    /// never through the command argv.
+    #[cfg(unix)]
+    #[test]
+    fn askpass_secret_never_appears_in_argv() {
+        let _serial = askpass_lock();
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let argv_dump = dir.path().join("argv.txt");
+        let fake_ssh = dir.path().join("ssh-argv");
+        std::fs::write(
+            &fake_ssh,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nif [ -n \"$SSH_ASKPASS\" ]; then \"$SSH_ASKPASS\" > /dev/null; fi\nexit 0\n",
+                argv_dump.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let res = try_askpass_first(
+            &[
+                fake_ssh.to_string_lossy().to_string(),
+                "user@host".into(),
+                "ls".into(),
+            ],
+            "sup3r-s3cret",
+        )
+        .expect("must report")
+        .expect("must succeed");
+        assert!(res.is_empty() || String::from_utf8_lossy(&res) != "sup3r-s3cret");
+        let argv = std::fs::read_to_string(&argv_dump).unwrap();
+        assert!(
+            !argv.contains("sup3r-s3cret"),
+            "secret must not be passed via argv: {argv}"
+        );
     }
 
     #[test]

@@ -9907,10 +9907,13 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
     // F-23: the shutdown cleanup below never runs after a crash or kill;
     // purge leftover drag-out staging up front. Only `drag-out` is safe
     // here — `staging` holds user edit-in-place data and swap journals
-    // that must survive until their recovery ran.
-    if let Ok(dir) = manifold_vfs::secure_runtime_subdir("drag-out") {
-        if dir.is_dir() {
-            let _ = std::fs::remove_dir_all(&dir);
+    // that must survive until their recovery ran. R12: the askpass dir
+    // can hold a leftover secret file from a crashed auth attempt.
+    for sub in ["drag-out", "askpass"] {
+        if let Ok(dir) = manifold_vfs::secure_runtime_subdir(sub) {
+            if dir.is_dir() {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
         }
     }
 
@@ -9942,6 +9945,8 @@ pub fn run_desktop_gui(initial_state: ManifoldAppState) -> Result<(), String> {
 /// R09: runtime subdirectories that only ever hold disposable caches.
 /// `staging` must NEVER be added — it holds user edit-in-place data
 /// whose lifecycle is owned by `RemoteEditStagingManager`.
+/// R12: `askpass` holds the temporary helper + secret file; normally
+/// removed right after each ssh call, purged here as a safety net.
 pub(crate) fn disposable_runtime_subdirs() -> &'static [&'static str] {
     &[
         "drag",
@@ -9949,6 +9954,7 @@ pub(crate) fn disposable_runtime_subdirs() -> &'static [&'static str] {
         "archive-preview",
         "cross-remote",
         "archive-contents",
+        "askpass",
     ]
 }
 
